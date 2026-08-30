@@ -9,7 +9,8 @@
 Giao diện Web hiện đại, dễ thao tác, hỗ trợ chọn thư mục lưu qua Windows Dialog hoặc các nút Preset nhanh, chọn định dạng tải, theo dõi tiến trình thời gian thực.
 
 ### 1. Khởi chạy ứng dụng:
-- **Cách nhanh nhất (Windows):** Nhấp đúp chuột vào tệp [`run_gui.bat`](file:///e:/DownDoc/run_gui.bat).
+- **Bật máy chủ & mở giao diện (Windows):** Nhấp đúp chuột vào tệp [`run_gui.bat`](file:///e:/DownDoc/run_gui.bat).
+- **Tắt / Dừng máy chủ (Windows):** Nhấp đúp chuột vào tệp [`stop_server.bat`](file:///e:/DownDoc/stop_server.bat).
 - **Hoặc chạy từ Terminal:**
   ```powershell
   python e:\DownDoc\app.py
