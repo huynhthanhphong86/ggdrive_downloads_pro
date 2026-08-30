@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Drive Downloads Pro - Tải Google Drive & Docs View-Only</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-background">
+        <div class="glow-sphere glow-1"></div>
+        <div class="glow-sphere glow-2"></div>
+    </div>
+
+    <div class="main-container">
+        <!-- HEADER -->
+        <header class="app-header">
+            <div class="logo-group">
+                <div class="logo-icon">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="logo-title">Google Drive <span>Downloads Pro</span></h1>
+                    <p class="logo-subtitle">Trình tải tài liệu Word, PDF & Thư mục Google Drive View-Only</p>
+                </div>
+            </div>
+            <div class="header-badges">
+                <div class="badge status-badge" id="systemStatus">
+                    <span class="status-dot"></span>
+                    <span id="systemStatusText">Hệ thống sẵn sàng</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- INPUT SECTION -->
+        <section class="card input-card">
+            <div class="card-header">
+                <div class="card-title">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                    <span>Nhập liên kết Google Drive (Folder / PDF) hoặc Google Docs</span>
+                </div>
+                <div class="quick-links">
+                    <button class="btn-chip" id="btnDemoFolder">
+                        <span>📁 Demo Thư mục (28 Bài)</span>
+                    </button>
+                    <button class="btn-chip" id="btnDemoPdf">
+                        <span>📕 Demo Drive PDF (11 Trang)</span>
+                    </button>
+                    <button class="btn-chip" id="btnDemoFile">
+                        <span>📄 Demo Google Docs</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="input-form">
+                <div class="input-wrapper">
+                    <input type="text" id="urlInput" placeholder="Dán link thư mục, tệp PDF Drive hoặc tài liệu Docs (View-Only)..." spellcheck="false" autocomplete="off">
+                    <button class="btn-icon" id="btnClearUrl" title="Xóa">✕</button>
+                </div>
+                <button class="btn btn-primary" id="btnScan">
+                    <span class="btn-text">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                        Quét liên kết
+                    </span>
+                    <span class="spinner" style="display: none;"></span>
+                </button>
+            </div>
+        </section>
+
+        <!-- CONFIGURATION SECTION -->
+        <section class="card config-card">
+            <div class="config-grid">
+                <!-- Vị trí lưu -->
+                <div class="config-item">
+                    <div class="config-label-row">
+                        <label class="config-label">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                            Thư mục lưu trữ
+                        </label>
+                    </div>
+                    <div class="path-picker">
+                        <input type="text" id="outputDirInput" value="{{ default_dir }}" spellcheck="false">
+                        <button class="btn btn-secondary" id="btnBrowseDir" title="Mở hộp thoại chọn thư mục">
+                            <span>📁 Duyệt...</span>
+                        </button>
+                        <button class="btn btn-icon-only" id="btnOpenDir" title="Mở thư mục trong File Explorer">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+                        </button>
+                    </div>
+                    <!-- Quick location presets -->
+                    <div class="path-presets">
+                        <span class="preset-label">Vị trí nhanh:</span>
+                        <button class="btn-preset active" data-path="{{ presets.downloads }}">📥 Downloads</button>
+                        <button class="btn-preset" data-path="{{ presets.desktop }}">🖥️ Desktop</button>
+                        <button class="btn-preset" data-path="{{ presets.workspace }}">💾 Workspace</button>
+                    </div>
+                </div>
+
+                <!-- Định dạng xuất -->
+                <div class="config-item">
+                    <label class="config-label">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                        Định dạng tải về
+                    </label>
+                    <div class="format-options">
+                        <label class="format-radio active" data-value="docx">
+                            <input type="radio" name="format" value="docx" checked>
+                            <span class="radio-icon">📝</span>
+                            <div class="radio-info">
+                                <span class="radio-title">Word (.docx)</span>
+                                <span class="radio-sub">Chuẩn bản gốc 100%</span>
+                            </div>
+                        </label>
+                        <label class="format-radio" data-value="pdf">
+                            <input type="radio" name="format" value="pdf">
+                            <span class="radio-icon">📄</span>
+                            <div class="radio-info">
+                                <span class="radio-title">PDF (.pdf)</span>
+                                <span class="radio-sub">Gốc / Canvas Retina</span>
+                            </div>
+                        </label>
+                        <label class="format-radio" data-value="all">
+                            <input type="radio" name="format" value="all">
+                            <span class="radio-icon">📦</span>
+                            <div class="radio-info">
+                                <span class="radio-title">Cả hai (.docx + .pdf)</span>
+                                <span class="radio-sub">Đầy đủ 2 định dạng</span>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- SCANNED ITEMS SECTION -->
+        <section class="card items-card" id="itemsSection" style="display: none;">
+            <div class="items-header">
+                <div class="items-meta">
+                    <h2 class="items-title" id="folderTitleText">Danh sách tệp tin</h2>
+                    <span class="count-badge" id="selectedCountBadge">Đã chọn: 0/0 tệp</span>
+                </div>
+                <div class="items-actions">
+                    <div class="search-box">
+                        <input type="text" id="filterInput" placeholder="Tìm kiếm tệp...">
+                    </div>
+                    <button class="btn btn-secondary btn-sm" id="btnSelectAll">Chọn tất cả</button>
+                    <button class="btn btn-secondary btn-sm" id="btnDeselectAll">Bỏ chọn</button>
+                    <button class="btn btn-primary btn-sm" id="btnStartDownload">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                        Bắt đầu tải
+                    </button>
+                </div>
+            </div>
+
+            <!-- TABLE -->
+            <div class="table-container">
+                <table class="items-table" id="itemsTable">
+                    <thead>
+                        <tr>
+                            <th width="40"><input type="checkbox" id="headerCheckbox" checked></th>
+                            <th width="60">#</th>
+                            <th>Tên tệp tin</th>
+                            <th width="220">Mã Google Drive ID</th>
+                            <th width="140">Trạng thái</th>
+                        </tr>
+                    </thead>
+                    <tbody id="itemsTableBody">
+                        <!-- Dynamic items inserted here -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- PROGRESS SECTION -->
+        <section class="card progress-card" id="progressSection" style="display: none;">
+            <div class="progress-info">
+                <div class="progress-text-group">
+                    <span class="progress-title" id="progressStatusTitle">Đang xử lý tải tệp...</span>
+                    <span class="progress-sub" id="currentFileName">Đang chuẩn bị...</span>
+                </div>
+                <div class="progress-percentage" id="progressPercentText">0%</div>
+            </div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+            </div>
+        </section>
+
+        <!-- TERMINAL LOG SECTION -->
+        <section class="card log-card">
+            <div class="log-header">
+                <div class="log-title">
+                    <span class="log-dot"></span>
+                    <span>Nhật ký hoạt động (Live Logs)</span>
+                </div>
+                <div class="log-actions">
+                    <button class="btn-link" id="btnClearLogs">Xóa nhật ký</button>
+                </div>
+            </div>
+            <div class="log-console" id="logConsole">
+                <div class="log-entry log-info">[Hệ thống] Google Drive Downloads Pro đã sẵn sàng. Hãy nhập liên kết để bắt đầu.</div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Downloaded files & temporary output
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.whtt
+*.html
+!templates/*.html
+*.log
+
+# Folders
+Downloads/
+DownDoc/
+output_images/
+images_*/
+test_folder_downloads/
+test_pdf_downloads/
+test_pdf_out/
+test_*.py
+inspect_*.py
+sniff_*.py
+check_*.py
+find_*.py
