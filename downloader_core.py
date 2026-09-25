@@ -32,6 +32,8 @@ from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt as PptxPt
 from pptx.dml.color import RGBColor as PptxRGB
 from pptx.enum.text import PP_ALIGN
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn as pptx_qn
 from lxml import etree
 
@@ -1148,59 +1150,102 @@ def _parse_css_color_rgb(c_str):
     return None
 
 
+def _hex_to_pptx_rgb(hex_str: str) -> PptxRGB:
+    if not hex_str or not hex_str.startswith('#'):
+        return PptxRGB(0, 0, 0)
+    h = hex_str.lstrip('#')
+    if len(h) == 3:
+        h = ''.join([c*2 for c in h])
+    if len(h) == 6:
+        try:
+            return PptxRGB(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+        except Exception:
+            return PptxRGB(0, 0, 0)
+    return PptxRGB(0, 0, 0)
+
+
+def _apply_shape_opacity(shape, opacity: float):
+    """Gán độ trong suốt (opacity/alpha) cho vector shape trong python-pptx"""
+    if opacity >= 0.99:
+        return
+    try:
+        alpha_val = int(max(0.0, min(1.0, opacity)) * 100000)
+        sp_elem = shape._element
+        spPr = sp_elem.spPr
+        solidFill = spPr.find('{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill')
+        if solidFill is not None:
+            srgb = solidFill.find('{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr')
+            if srgb is not None:
+                alpha = parse_xml(f'<a:alpha xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" val="{alpha_val}"/>')
+                srgb.append(alpha)
+    except Exception:
+        pass
+
+
 def download_single_presentation_pptx_editable(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
     """
-    Tái tạo tệp PowerPoint PPTX hoàn chỉnh vừa có ảnh minh họa vừa có văn bản chỉnh sửa được:
-    - Ảnh nền: trích xuất lớp hình ảnh & đồ họa gốc không chứa chữ (showText=0) giữ trọn vẹn 100% hình ảnh minh họa, background và layout
-    - Văn bản: tái tạo thành các textbox chuẩn của PowerPoint tại đúng vị trí, font chữ, kích cỡ, màu sắc, bold, italic
-    - Ghi chú: lưu toàn bộ văn bản mỗi slide vào phần Speaker Notes
+    Tái tạo tệp PowerPoint PPTX hoàn chỉnh với các đối tượng tách biệt tối đa:
+    - Nền slide (Background): Nền riêng biệt (màu chuẩn hoặc background fill)
+    - Khung Shapes: Vector shapes riêng biệt (Hình Ôvan, Hình chữ nhật bo góc, Card, Badge)
+      với đầy đủ màu fill, độ mờ (alpha/transparency), viền
+    - Hình ảnh (Images): Các ảnh minh họa/đồ họa dạng PNG trong suốt / JPEG độc lập
+      có thể phóng to, thu nhỏ, di chuyển, thay thế
+    - Văn bản (Text layer): Từng textbox riêng biệt với font, cỡ chữ, màu sắc, bold, italic
+    - Ghi chú: Speaker Notes đầy đủ
+    - Chế độ dự phòng (Fallback): Nếu tài liệu không đọc được /edit cấu trúc chi tiết,
+      tự động dùng cơ chế showText=0 + Text layer hoặc Playwright
     """
     doc_id, _ = extract_id_and_type(url)
-    log_cb(f"  [PPTX Editable] Bắt đầu xử lý bài thuyết trình: {doc_id}")
+    log_cb(f"  [PPTX Tách đối tượng] Bắt đầu xử lý bài thuyết trình: {doc_id}")
 
+    edit_url = f"https://docs.google.com/presentation/d/{doc_id}/edit"
     html_url = f"https://docs.google.com/presentation/d/{doc_id}/htmlpresent"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
+    # -------------------------------------------------------------
+    # PHƯƠNG PHÁP 1: TÁCH BIỆT HOÀN TOÀN CÁC ĐỐI TƯỢNG (SEPARATED OBJECTS ENGINE)
+    # Nền riêng + Khung shape vector riêng + Ảnh minh họa riêng + Text layer chuẩn
+    # -------------------------------------------------------------
     try:
-        log_cb(f"  [PPTX Editable] Bước 1/3: Đang tải cấu trúc slide & nội dung...")
-        resp = requests.get(html_url, headers=headers, timeout=25)
-        if resp.status_code == 200 and len(resp.text) > 1000:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            slide_elements = soup.find_all(class_='slide')
-            total = len(slide_elements)
+        log_cb(f"  [PPTX Tách đối tượng] Bước 1/3: Đang phân tích mô hình tài liệu (/edit & /htmlpresent)...")
+        r_edit = requests.get(edit_url, headers=headers, timeout=25)
+        r_html = requests.get(html_url, headers=headers, timeout=25)
+
+        if r_edit.status_code == 200 and r_html.status_code == 200:
+            m_img = re.search(r'SK_config\[\'documentImageUrls\'\]\s*=\s*(\{.*?\});', r_edit.text)
+            image_urls = json.loads(m_img.group(1)) if m_img else {}
+
+            model_chunks_str = re.findall(r'var modelChunk = (\{.*?\});\s*var modelChunkParseEnd', r_edit.text, re.DOTALL)
+            soup = BeautifulSoup(r_html.text, 'html.parser')
+            slides_html = soup.find_all(class_='slide')
+            total = min(len(model_chunks_str), len(slides_html))
 
             if total > 0:
-                log_cb(f"  [PPTX Editable] Phát hiện {total} slide. Bước 2/3: Đang tải song song các hình nền minh họa...")
+                log_cb(f"  [PPTX Tách đối tượng] Phát hiện {total} slide và {len(image_urls)} hình ảnh minh họa độc lập.")
 
-                # Thu thập link ảnh nền (showText=0 là ảnh slide gốc không có chữ)
-                bg_urls = {}
-                for idx, slide_el in enumerate(slide_elements):
-                    sc = slide_el.find(class_='slide-content')
-                    if sc:
-                        st = _parse_css_dict(sc.get('style', ''))
-                        m = re.search(r'url\((.*?)\)', st.get('background-image', ''))
-                        if m:
-                            bg_urls[idx] = m.group(1).strip('\'"')
+                # Tải song song tất cả các hình ảnh độc lập (high-res transparent PNG)
+                downloaded_images = {}
+                if image_urls:
+                    log_cb(f"  [PPTX Tách đối tượng] Bước 2/3: Đang tải song song {len(image_urls)} ảnh minh họa PNG...")
+                    def _fetch_img(item):
+                        b_id, u = item
+                        try:
+                            r = requests.get(u, headers=headers, timeout=20)
+                            if r.status_code == 200 and len(r.content) > 100:
+                                return b_id, r.content
+                        except Exception:
+                            pass
+                        return b_id, None
 
-                # Tải ảnh song song
-                bg_images = {}
-                def _fetch_bg(item):
-                    s_idx, u = item
-                    try:
-                        r = requests.get(u, headers=headers, timeout=25)
-                        if r.status_code == 200 and len(r.content) > 100:
-                            return s_idx, r.content
-                    except Exception:
-                        pass
-                    return s_idx, None
+                    with ThreadPoolExecutor(max_workers=15) as ex:
+                        for b_id, content in ex.map(_fetch_img, image_urls.items()):
+                            if content:
+                                downloaded_images[b_id] = content
+                    log_cb(f"  [PPTX Tách đối tượng] Đã nạp thành công {len(downloaded_images)}/{len(image_urls)} ảnh minh họa.")
+                else:
+                    log_cb(f"  [PPTX Tách đối tượng] Bước 2/3: Chuẩn bị dựng các khung shape & text...")
 
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    for s_idx, content in executor.map(_fetch_bg, bg_urls.items()):
-                        if content:
-                            bg_images[s_idx] = content
-
-                log_cb(f"  [PPTX Editable] Đã nạp {len(bg_images)}/{len(bg_urls)} hình nền. Bước 3/3: Đang dựng tệp PowerPoint...")
-
+                log_cb(f"  [PPTX Tách đối tượng] Bước 3/3: Đang dựng PowerPoint với các đối tượng tách biệt...")
                 prs = Presentation()
                 prs.slide_width = PptxInches(13.333)
                 prs.slide_height = PptxInches(7.5)
@@ -1208,58 +1253,175 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                 SH_in = 7.5
                 blank_layout = prs.slide_layouts[6]
 
-                for idx, slide_el in enumerate(slide_elements):
-                    sc = slide_el.find(class_='slide-content')
+                for idx in range(total):
+                    slide = prs.slides.add_slide(blank_layout)
+                    s_el = slides_html[idx]
+                    chunk_data = json.loads(model_chunks_str[idx])
+                    chunk = chunk_data.get('chunk', [])
+
+                    # A. Nền Slide riêng biệt (Slide Background Color)
+                    bg_color_hex = '#FFFFFF'
+                    for op in chunk:
+                        if op[0] == 9 and len(op) > 2:
+                            for p in op[2]:
+                                if isinstance(p, str) and p.startswith('#'):
+                                    bg_color_hex = p
+                                    break
+
+                    background = slide.background
+                    fill = background.fill
+                    fill.solid()
+                    fill.fore_color.rgb = _hex_to_pptx_rgb(bg_color_hex)
+
+                    # B. Trích xuất phần tử đồ họa từ modelChunk
+                    model_elements = []
+                    for op in chunk:
+                        if op[0] == 3 and len(op) > 2:
+                            el_id = op[1]
+                            t_id = op[2]
+                            trans = op[3]
+                            props = op[4]
+                            if t_id in [3, 7, 8]:
+                                model_elements.append({
+                                    'id': el_id,
+                                    'type': t_id,
+                                    'trans': trans,
+                                    'props': props
+                                })
+
+                    # C. Phân loại đối tượng từ htmlpresent
+                    sc = s_el.find(class_='slide-content')
                     base_w, base_h = 1280.0, 720.0
                     if sc:
                         sc_style = _parse_css_dict(sc.get('style', ''))
                         base_w = _parse_px(sc_style.get('width'), 1280.0)
                         base_h = _parse_px(sc_style.get('height'), 720.0)
-
                     scale_x = SW_in / base_w
                     scale_y = SH_in / base_h
 
-                    slide = prs.slides.add_slide(blank_layout)
+                    hp_shapes = []
+                    for sh in s_el.find_all(class_='shape'):
+                        role = sh.get('role', '')
+                        title = sh.get('title', '')
+                        txt = sh.get_text().strip()
+                        st = _parse_css_dict(sh.get('style', ''))
+                        w = _parse_px(st.get('width', 0))
+                        h = _parse_px(st.get('height', 0))
+                        left = _parse_px(st.get('left', 0))
+                        top = _parse_px(st.get('top', 0))
+                        hp_shapes.append({
+                            'role': role,
+                            'title': title,
+                            'text': txt,
+                            'w': w,
+                            'h': h,
+                            'left': left,
+                            'top': top,
+                            'el': sh
+                        })
 
-                    # 1. Ảnh nền minh họa không chữ
-                    img_bytes = bg_images.get(idx)
-                    if img_bytes:
-                        try:
-                            bg_pic = slide.shapes.add_picture(
-                                io.BytesIO(img_bytes), 0, 0,
-                                width=prs.slide_width,
-                                height=prs.slide_height
-                            )
-                            # Đưa ảnh nền xuống dưới cùng z-order
-                            spTree = slide.shapes._spTree
-                            sp_elem = bg_pic._element
-                            spTree.remove(sp_elem)
-                            spTree.insert(2, sp_elem)
-                        except Exception as e:
-                            log_cb(f"    ⚠ Slide {idx+1} ảnh nền: {e}")
+                    # D. Thêm các Khung Shape vector riêng biệt (Ovals, Rounded Rectangles, Cards, Badges)
+                    used_shape_m_ids = set()
+                    for sh in hp_shapes:
+                        if sh['role'] != 'img' and not sh['text'] and sh['w'] > 5 and sh['h'] > 5:
+                            x_in = sh['left'] * scale_x
+                            y_in = sh['top'] * scale_y
+                            w_in = sh['w'] * scale_x
+                            h_in = sh['h'] * scale_y
 
-                    # 2. Tạo text box cho các hình có chữ
-                    shapes = slide_el.find_all(class_='shape')
+                            matched_m = None
+                            best_dist = 999999
+                            for m in model_elements:
+                                if m['id'] in used_shape_m_ids:
+                                    continue
+                                is_oval = ('ôvan' in sh['title'].lower() and m['type'] == 8)
+                                is_round = ('tròn' in sh['title'].lower() and m['type'] == 7)
+                                if is_oval or is_round or m['type'] in [7, 8]:
+                                    m_x = m['trans'][4] / 36576.0
+                                    m_y = m['trans'][5] / 36576.0
+                                    dist = (x_in - m_x)**2 + (y_in - m_y)**2
+                                    if dist < best_dist:
+                                        best_dist = dist
+                                        matched_m = m
+
+                            fill_hex = '#EAF4F6' if bg_color_hex == '#FFFFFF' else '#0E7C8C'
+                            opacity = 1.0
+                            if matched_m:
+                                used_shape_m_ids.add(matched_m['id'])
+                                props = matched_m['props']
+                                for idx_p, p in enumerate(props):
+                                    if isinstance(p, str) and p.startswith('#'):
+                                        fill_hex = p
+                                    if p == 16 and idx_p + 1 < len(props) and isinstance(props[idx_p + 1], (int, float)):
+                                        opacity = float(props[idx_p + 1])
+
+                            mso_shape = MSO_SHAPE.OVAL if 'ôvan' in sh['title'].lower() else MSO_SHAPE.ROUNDED_RECTANGLE
+                            try:
+                                new_shape = slide.shapes.add_shape(
+                                    mso_shape,
+                                    PptxInches(x_in), PptxInches(y_in),
+                                    PptxInches(w_in), PptxInches(h_in)
+                                )
+                                new_shape.line.fill.background()
+                                new_shape.fill.solid()
+                                new_shape.fill.fore_color.rgb = _hex_to_pptx_rgb(fill_hex)
+                                _apply_shape_opacity(new_shape, opacity)
+                            except Exception:
+                                pass
+
+                    # E. Thêm các Hình ảnh minh họa riêng biệt (Picture shape PNG trong suốt)
+                    used_img_m_ids = set()
+                    for sh in hp_shapes:
+                        if sh['role'] == 'img':
+                            x_in = sh['left'] * scale_x
+                            y_in = sh['top'] * scale_y
+                            w_in = sh['w'] * scale_x
+                            h_in = sh['h'] * scale_y
+
+                            matched_img_m = None
+                            best_dist = 999999
+                            for m in model_elements:
+                                if m['type'] == 3 and m['id'] not in used_img_m_ids:
+                                    m_x = m['trans'][4] / 36576.0
+                                    m_y = m['trans'][5] / 36576.0
+                                    dist = (x_in - m_x)**2 + (y_in - m_y)**2
+                                    if dist < best_dist:
+                                        best_dist = dist
+                                        matched_img_m = m
+
+                            img_bytes = None
+                            if matched_img_m:
+                                used_img_m_ids.add(matched_img_m['id'])
+                                props = matched_img_m['props']
+                                for idx_p, p in enumerate(props):
+                                    if p == 49 and idx_p + 1 < len(props):
+                                        b_id = props[idx_p + 1]
+                                        img_bytes = downloaded_images.get(b_id)
+                                        break
+
+                            if img_bytes:
+                                try:
+                                    slide.shapes.add_picture(
+                                        io.BytesIO(img_bytes),
+                                        PptxInches(x_in), PptxInches(y_in),
+                                        PptxInches(w_in), PptxInches(h_in)
+                                    )
+                                except Exception:
+                                    pass
+
+                    # F. Thêm các Hộp Text Box riêng biệt (văn bản giữ đúng font, màu, kích thước, bold/italic)
                     slide_texts = []
-
-                    for shape_el in shapes:
-                        text_content = shape_el.get_text().strip()
-                        if not text_content:
+                    for sh in hp_shapes:
+                        if not sh['text']:
                             continue
-                        slide_texts.append(text_content)
+                        slide_texts.append(sh['text'])
 
-                        st = _parse_css_dict(shape_el.get('style', ''))
-                        l_px = _parse_px(st.get('left'), 0)
-                        t_px = _parse_px(st.get('top'), 0)
-                        w_px = _parse_px(st.get('width'), 200)
-                        h_px = _parse_px(st.get('height'), 50)
+                        x_in = max(0.0, sh['left'] * scale_x)
+                        y_in = max(0.0, sh['top'] * scale_y)
+                        w_in = max(0.2, sh['w'] * scale_x)
+                        h_in = max(0.2, sh['h'] * scale_y)
 
-                        l_in = PptxInches(max(0.0, l_px * scale_x))
-                        t_in = PptxInches(max(0.0, t_px * scale_y))
-                        w_in = PptxInches(max(0.2, w_px * scale_x))
-                        h_in = PptxInches(max(0.2, h_px * scale_y))
-
-                        tb = slide.shapes.add_textbox(l_in, t_in, w_in, h_in)
+                        tb = slide.shapes.add_textbox(PptxInches(x_in), PptxInches(y_in), PptxInches(w_in), PptxInches(h_in))
                         _pptx_set_transparent_fill(tb)
                         tf = tb.text_frame
                         tf.word_wrap = True
@@ -1268,13 +1430,13 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                         tf.margin_top = PptxInches(0.01)
                         tf.margin_bottom = PptxInches(0.01)
 
+                        shape_el = sh['el']
                         paragraphs = shape_el.find_all('p') or [shape_el]
                         para_index = 0
 
                         for p_el in paragraphs:
                             p_style = _parse_css_dict(p_el.get('style', ''))
                             ta = p_style.get('text-align', 'left')
-
                             p_fs = _parse_pt(p_style.get('font-size'), 14.0)
                             p_fw = p_style.get('font-weight', '400')
                             p_bold = (p_fw in ['bold', '700', '800', '900'] or (p_fw.isdigit() and int(p_fw) >= 700))
@@ -1346,7 +1508,7 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                                 if r_info['color']:
                                     run.font.color.rgb = r_info['color']
 
-                    # 3. Speaker Notes
+                    # G. Ghi chú Speaker Notes
                     if slide_texts:
                         try:
                             notes_tf = slide.notes_slide.notes_text_frame
@@ -1355,18 +1517,215 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                         except Exception:
                             pass
 
-                    if (idx + 1) % 10 == 0 or (idx + 1) == total:
-                        log_cb(f"    ✓ Đã hoàn thiện {idx+1}/{total} slide")
+                    if (idx + 1) % 15 == 0 or (idx + 1) == total:
+                        log_cb(f"    ✓ Đã hoàn thiện {idx+1}/{total} slide tách đối tượng")
 
                 os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
                 prs.save(output_path)
-                log_cb(f"  ✓ Hoàn tất PPTX Editable: {os.path.basename(output_path)} ({total} slide, {os.path.getsize(output_path)/1024/1024:.2f} MB)")
-                log_cb(f"  💡 Đầy đủ ảnh minh họa + đồ họa nền. Văn bản giữ chuẩn định dạng, màu sắc, font chữ và hoàn toàn chỉnh sửa được!")
+                file_size_mb = os.path.getsize(output_path) / 1024 / 1024
+                log_cb(f"  ✓ Hoàn tất PPTX Tách đối tượng: {os.path.basename(output_path)} ({total} slide, {file_size_mb:.2f} MB)")
+                log_cb(f"  🌟 TÁCH BIỆT HOÀN TOÀN: Nền slide riêng + Khung shape vector riêng + Hình ảnh riêng + Text layer chỉnh sửa 100%!")
                 return output_path
     except Exception as e:
-        log_cb(f"  ⚠ Lỗi xử lý htmlpresent: {e}. Đang chuyển sang phương thức dự phòng...")
+        log_cb(f"  ⚠ Lỗi phương pháp tách đối tượng: {e}. Đang chuyển sang phương thức dự phòng...")
 
-    # Fallback to Playwright screenshot method if htmlpresent failed
+    # -------------------------------------------------------------
+    # PHƯƠNG PHÁP 2: DỰ PHÒNG DÙNG ẢNH NỀN SẠCH (showText=0) + TEXT LAYER
+    # -------------------------------------------------------------
+    try:
+        log_cb(f"  [PPTX Dự phòng] Đang tải cấu trúc slide & hình nền sạch...")
+        resp = requests.get(html_url, headers=headers, timeout=25)
+        if resp.status_code == 200 and len(resp.text) > 1000:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            slide_elements = soup.find_all(class_='slide')
+            total = len(slide_elements)
+
+            if total > 0:
+                bg_urls = {}
+                for idx, slide_el in enumerate(slide_elements):
+                    sc = slide_el.find(class_='slide-content')
+                    if sc:
+                        st = _parse_css_dict(sc.get('style', ''))
+                        m = re.search(r'url\((.*?)\)', st.get('background-image', ''))
+                        if m:
+                            bg_urls[idx] = m.group(1).strip('\'"')
+
+                bg_images = {}
+                def _fetch_bg(item):
+                    s_idx, u = item
+                    try:
+                        r = requests.get(u, headers=headers, timeout=25)
+                        if r.status_code == 200 and len(r.content) > 100:
+                            return s_idx, r.content
+                    except Exception:
+                        pass
+                    return s_idx, None
+
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    for s_idx, content in executor.map(_fetch_bg, bg_urls.items()):
+                        if content:
+                            bg_images[s_idx] = content
+
+                prs = Presentation()
+                prs.slide_width = PptxInches(13.333)
+                prs.slide_height = PptxInches(7.5)
+                SW_in = 13.333
+                SH_in = 7.5
+                blank_layout = prs.slide_layouts[6]
+
+                for idx, slide_el in enumerate(slide_elements):
+                    sc = slide_el.find(class_='slide-content')
+                    base_w, base_h = 1280.0, 720.0
+                    if sc:
+                        sc_style = _parse_css_dict(sc.get('style', ''))
+                        base_w = _parse_px(sc_style.get('width'), 1280.0)
+                        base_h = _parse_px(sc_style.get('height'), 720.0)
+
+                    scale_x = SW_in / base_w
+                    scale_y = SH_in / base_h
+
+                    slide = prs.slides.add_slide(blank_layout)
+
+                    img_bytes = bg_images.get(idx)
+                    if img_bytes:
+                        try:
+                            bg_pic = slide.shapes.add_picture(
+                                io.BytesIO(img_bytes), 0, 0,
+                                width=prs.slide_width,
+                                height=prs.slide_height
+                            )
+                            spTree = slide.shapes._spTree
+                            sp_elem = bg_pic._element
+                            spTree.remove(sp_elem)
+                            spTree.insert(2, sp_elem)
+                        except Exception:
+                            pass
+
+                    shapes = slide_el.find_all(class_='shape')
+                    slide_texts = []
+
+                    for shape_el in shapes:
+                        text_content = shape_el.get_text().strip()
+                        if not text_content:
+                            continue
+                        slide_texts.append(text_content)
+
+                        st = _parse_css_dict(shape_el.get('style', ''))
+                        l_px = _parse_px(st.get('left'), 0)
+                        t_px = _parse_px(st.get('top'), 0)
+                        w_px = _parse_px(st.get('width'), 200)
+                        h_px = _parse_px(st.get('height'), 50)
+
+                        l_in = PptxInches(max(0.0, l_px * scale_x))
+                        t_in = PptxInches(max(0.0, t_px * scale_y))
+                        w_in = PptxInches(max(0.2, w_px * scale_x))
+                        h_in = PptxInches(max(0.2, h_px * scale_y))
+
+                        tb = slide.shapes.add_textbox(l_in, t_in, w_in, h_in)
+                        _pptx_set_transparent_fill(tb)
+                        tf = tb.text_frame
+                        tf.word_wrap = True
+                        tf.margin_left = PptxInches(0.02)
+                        tf.margin_right = PptxInches(0.02)
+                        tf.margin_top = PptxInches(0.01)
+                        tf.margin_bottom = PptxInches(0.01)
+
+                        paragraphs = shape_el.find_all('p') or [shape_el]
+                        para_index = 0
+
+                        for p_el in paragraphs:
+                            p_style = _parse_css_dict(p_el.get('style', ''))
+                            ta = p_style.get('text-align', 'left')
+                            p_fs = _parse_pt(p_style.get('font-size'), 14.0)
+                            p_fw = p_style.get('font-weight', '400')
+                            p_bold = (p_fw in ['bold', '700', '800', '900'] or (p_fw.isdigit() and int(p_fw) >= 700))
+                            p_italic = (p_style.get('font-style') == 'italic')
+                            p_color = _parse_css_color_rgb(p_style.get('color'))
+                            p_ff = p_style.get('font-family', 'Arial').strip('\'"')
+
+                            runs_data = []
+                            children = list(p_el.children) if hasattr(p_el, 'children') else [p_el]
+                            if not children:
+                                children = [p_el]
+
+                            for child in children:
+                                if isinstance(child, NavigableString):
+                                    raw_text = str(child).replace('\ufffd', '\n').replace('\u000b', '\n').replace('\r', '')
+                                    if raw_text:
+                                        runs_data.append({
+                                            'text': raw_text,
+                                            'size': p_fs,
+                                            'bold': p_bold,
+                                            'italic': p_italic,
+                                            'color': p_color,
+                                            'font': p_ff
+                                        })
+                                elif isinstance(child, Tag):
+                                    raw_text = child.get_text().replace('\ufffd', '\n').replace('\u000b', '\n').replace('\r', '')
+                                    if not raw_text:
+                                        continue
+                                    c_style = _parse_css_dict(child.get('style', ''))
+                                    c_fs = _parse_pt(c_style.get('font-size'), p_fs)
+                                    c_fw = c_style.get('font-weight', p_fw)
+                                    c_bold = (c_fw in ['bold', '700', '800', '900'] or (c_fw.isdigit() and int(c_fw) >= 700))
+                                    c_italic = (c_style.get('font-style') == 'italic') if 'font-style' in c_style else p_italic
+                                    c_color = _parse_css_color_rgb(c_style.get('color')) or p_color
+                                    c_ff = c_style.get('font-family', p_ff).strip('\'"')
+
+                                    runs_data.append({
+                                        'text': raw_text,
+                                        'size': c_fs,
+                                        'bold': c_bold,
+                                        'italic': c_italic,
+                                        'color': c_color,
+                                        'font': c_ff
+                                    })
+
+                            if not runs_data:
+                                continue
+
+                            p_para = tf.paragraphs[0] if para_index == 0 else tf.add_paragraph()
+                            para_index += 1
+
+                            if ta == 'center':
+                                p_para.alignment = PP_ALIGN.CENTER
+                            elif ta == 'right':
+                                p_para.alignment = PP_ALIGN.RIGHT
+                            elif ta == 'justify':
+                                p_para.alignment = PP_ALIGN.JUSTIFY
+                            else:
+                                p_para.alignment = PP_ALIGN.LEFT
+
+                            for r_info in runs_data:
+                                run = p_para.add_run()
+                                run.text = r_info['text']
+                                run.font.size = PptxPt(r_info['size'])
+                                run.font.bold = r_info['bold']
+                                run.font.italic = r_info['italic']
+                                if r_info['font']:
+                                    run.font.name = r_info['font']
+                                if r_info['color']:
+                                    run.font.color.rgb = r_info['color']
+
+                    if slide_texts:
+                        try:
+                            notes_tf = slide.notes_slide.notes_text_frame
+                            notes_tf.clear()
+                            notes_tf.text = f"[Slide {idx + 1}]\n" + "\n\n".join(slide_texts)
+                        except Exception:
+                            pass
+
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                prs.save(output_path)
+                file_size_mb = os.path.getsize(output_path) / 1024 / 1024
+                log_cb(f"  ✓ Hoàn tất PPTX Editable: {os.path.basename(output_path)} ({total} slide, {file_size_mb:.2f} MB)")
+                return output_path
+    except Exception as e:
+        log_cb(f"  ⚠ Lỗi xử lý htmlpresent: {e}. Đang chuyển sang Playwright...")
+
+    # -------------------------------------------------------------
+    # PHƯƠNG PHÁP 3: DỰ PHÒNG CUỐI CÙNG BẰNG PLAYWRIGHT SCREENSHOTS
+    # -------------------------------------------------------------
     log_cb("  [PPTX Editable] Sử dụng chế độ dự phòng bằng Playwright...")
     return _download_single_presentation_pptx_images(url, output_path, scale=scale, quality=quality, log_cb=log_cb)
 
