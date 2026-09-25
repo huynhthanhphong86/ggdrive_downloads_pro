@@ -31,7 +31,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt as PptxPt
 from pptx.dml.color import RGBColor as PptxRGB
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn as pptx_qn
@@ -1182,6 +1182,90 @@ def _apply_shape_opacity(shape, opacity: float):
         pass
 
 
+def _props_to_dict(props):
+    pd = {}
+    i = 0
+    while i < len(props) - 1:
+        pd[props[i]] = props[i+1]
+        i += 2
+    return pd
+
+
+def _parse_html_shape_runs(html_shape):
+    html_p_list = html_shape.find_all('p') or [html_shape]
+    all_paras = []
+
+    for p_tag in html_p_list:
+        p_style = _parse_css_dict(p_tag.get('style', ''))
+        ta_str = p_style.get('text-align', 'left')
+        if ta_str == 'center':
+            ta = PP_ALIGN.CENTER
+        elif ta_str == 'right':
+            ta = PP_ALIGN.RIGHT
+        elif ta_str == 'justify':
+            ta = PP_ALIGN.JUSTIFY
+        else:
+            ta = PP_ALIGN.LEFT
+
+        p_fs = _parse_pt(p_style.get('font-size'), 14.0)
+        p_fw = p_style.get('font-weight', '400')
+        p_bold = (p_fw in ['bold', '700', '800', '900'] or (p_fw.isdigit() and int(p_fw) >= 700))
+        p_italic = ('italic' in p_style.get('font-style', ''))
+        p_color = _parse_css_color_rgb(p_style.get('color')) or PptxRGB(0, 0, 0)
+        p_ff = p_style.get('font-family', 'Arial').strip('\'"')
+
+        paras_data = []
+        curr_runs = []
+
+        def _add_piece(text, size, bold, italic, color, font):
+            nonlocal curr_runs, paras_data
+            parts = re.split(r'[\r\n\ufffd\x0b]+', text)
+            for i_part, part in enumerate(parts):
+                if i_part > 0:
+                    paras_data.append(curr_runs)
+                    curr_runs = []
+                if part:
+                    curr_runs.append({
+                        'text': part,
+                        'size': size,
+                        'bold': bold,
+                        'italic': italic,
+                        'color': color,
+                        'font': font
+                    })
+
+        children = list(p_tag.children) if hasattr(p_tag, 'children') else [p_tag]
+        if not children:
+            children = [p_tag]
+
+        for child in children:
+            if isinstance(child, NavigableString):
+                raw_str = str(child)
+                if raw_str:
+                    _add_piece(raw_str, p_fs, p_bold, p_italic, p_color, p_ff)
+            elif isinstance(child, Tag):
+                raw_str = child.get_text()
+                if not raw_str:
+                    continue
+                c_style = _parse_css_dict(child.get('style', ''))
+                c_fs = _parse_pt(c_style.get('font-size'), p_fs)
+                c_fw = c_style.get('font-weight', p_fw)
+                c_bold = (c_fw in ['bold', '700', '800', '900'] or (c_fw.isdigit() and int(c_fw) >= 700))
+                c_italic = ('italic' in c_style.get('font-style', '')) if 'font-style' in c_style else p_italic
+                c_color = _parse_css_color_rgb(c_style.get('color')) or p_color
+                c_ff = c_style.get('font-family', p_ff).strip('\'"')
+                _add_piece(raw_str, c_fs, c_bold, c_italic, c_color, c_ff)
+
+        if curr_runs or not paras_data:
+            paras_data.append(curr_runs)
+
+        for p_runs in paras_data:
+            if p_runs:
+                all_paras.append({'alignment': ta, 'runs': p_runs})
+
+    return all_paras
+
+
 def download_single_presentation_pptx_editable(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
     """
     Tái tạo tệp PowerPoint PPTX hoàn chỉnh với các đối tượng tách biệt tối đa:
@@ -1245,21 +1329,26 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                 else:
                     log_cb(f"  [PPTX Tách đối tượng] Bước 2/3: Chuẩn bị dựng các khung shape & text...")
 
-                log_cb(f"  [PPTX Tách đối tượng] Bước 3/3: Đang dựng PowerPoint với các đối tượng tách biệt...")
+                log_cb(f"  [PPTX Tách đối tượng] Bước 3/3: Đang dựng PowerPoint với các đối tượng tách biệt chuẩn xác 100%...")
                 prs = Presentation()
-                prs.slide_width = PptxInches(13.333)
-                prs.slide_height = PptxInches(7.5)
-                SW_in = 13.333
-                SH_in = 7.5
+                sw_in = 13.333
+                sh_in = 7.5
+                c0_first = json.loads(model_chunks_str[0]).get('chunk', [])
+                for op in c0_first:
+                    if op[0] == 1 and len(op) > 1 and isinstance(op[1], list) and len(op[1]) >= 2:
+                        sw_in = op[1][0] / 36576.0
+                        sh_in = op[1][1] / 36576.0
+                        break
+                prs.slide_width = PptxInches(sw_in)
+                prs.slide_height = PptxInches(sh_in)
                 blank_layout = prs.slide_layouts[6]
 
                 for idx in range(total):
                     slide = prs.slides.add_slide(blank_layout)
                     s_el = slides_html[idx]
-                    chunk_data = json.loads(model_chunks_str[idx])
-                    chunk = chunk_data.get('chunk', [])
+                    chunk = json.loads(model_chunks_str[idx]).get('chunk', [])
 
-                    # A. Nền Slide riêng biệt (Slide Background Color)
+                    # 1. Slide Background
                     bg_color_hex = '#FFFFFF'
                     for op in chunk:
                         if op[0] == 9 and len(op) > 2:
@@ -1267,98 +1356,35 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                                 if isinstance(p, str) and p.startswith('#'):
                                     bg_color_hex = p
                                     break
-
-                    background = slide.background
-                    fill = background.fill
+                    fill = slide.background.fill
                     fill.solid()
                     fill.fore_color.rgb = _hex_to_pptx_rgb(bg_color_hex)
 
-                    # B. Trích xuất phần tử đồ họa từ modelChunk
-                    model_elements = []
+                    # 2. Extract elements from model chunk
+                    html_texts = [sh for sh in s_el.find_all(class_='shape') if sh.get_text().strip()]
+                    text_ptr = 0
+                    slide_texts = []
+
                     for op in chunk:
-                        if op[0] == 3 and len(op) > 2:
-                            el_id = op[1]
-                            t_id = op[2]
-                            trans = op[3]
-                            props = op[4]
-                            if t_id in [3, 7, 8]:
-                                model_elements.append({
-                                    'id': el_id,
-                                    'type': t_id,
-                                    'trans': trans,
-                                    'props': props
-                                })
+                        if op[0] != 3 or len(op) <= 2:
+                            continue
+                        el_id = op[1]
+                        t_id = op[2]
+                        trans = op[3]
+                        props = op[4] if len(op) > 4 else []
+                        pd = _props_to_dict(props)
 
-                    # C. Phân loại đối tượng từ htmlpresent
-                    sc = s_el.find(class_='slide-content')
-                    base_w, base_h = 1280.0, 720.0
-                    if sc:
-                        sc_style = _parse_css_dict(sc.get('style', ''))
-                        base_w = _parse_px(sc_style.get('width'), 1280.0)
-                        base_h = _parse_px(sc_style.get('height'), 720.0)
-                    scale_x = SW_in / base_w
-                    scale_y = SH_in / base_h
-
-                    hp_shapes = []
-                    for sh in s_el.find_all(class_='shape'):
-                        role = sh.get('role', '')
-                        title = sh.get('title', '')
-                        txt = sh.get_text().strip()
-                        st = _parse_css_dict(sh.get('style', ''))
-                        w = _parse_px(st.get('width', 0))
-                        h = _parse_px(st.get('height', 0))
-                        left = _parse_px(st.get('left', 0))
-                        top = _parse_px(st.get('top', 0))
-                        hp_shapes.append({
-                            'role': role,
-                            'title': title,
-                            'text': txt,
-                            'w': w,
-                            'h': h,
-                            'left': left,
-                            'top': top,
-                            'el': sh
-                        })
-
-                    # D. Thêm các Khung Shape vector riêng biệt (Ovals, Rounded Rectangles, Cards, Badges)
-                    used_shape_m_ids = set()
-                    for sh in hp_shapes:
-                        if sh['role'] != 'img' and not sh['text'] and sh['w'] > 5 and sh['h'] > 5:
-                            x_in = sh['left'] * scale_x
-                            y_in = sh['top'] * scale_y
-                            w_in = sh['w'] * scale_x
-                            h_in = sh['h'] * scale_y
-
-                            matched_m = None
-                            best_dist = 999999
-                            for m in model_elements:
-                                if m['id'] in used_shape_m_ids:
-                                    continue
-                                is_oval = ('ôvan' in sh['title'].lower() and m['type'] == 8)
-                                is_round = ('tròn' in sh['title'].lower() and m['type'] == 7)
-                                if is_oval or is_round or m['type'] in [7, 8]:
-                                    m_x = m['trans'][4] / 36576.0
-                                    m_y = m['trans'][5] / 36576.0
-                                    dist = (x_in - m_x)**2 + (y_in - m_y)**2
-                                    if dist < best_dist:
-                                        best_dist = dist
-                                        matched_m = m
-
-                            fill_hex = '#EAF4F6' if bg_color_hex == '#FFFFFF' else '#0E7C8C'
-                            opacity = 1.0
-                            if matched_m:
-                                used_shape_m_ids.add(matched_m['id'])
-                                props = matched_m['props']
-                                for idx_p, p in enumerate(props):
-                                    if isinstance(p, str) and p.startswith('#'):
-                                        fill_hex = p
-                                    if p == 16 and idx_p + 1 < len(props) and isinstance(props[idx_p + 1], (int, float)):
-                                        opacity = float(props[idx_p + 1])
-
-                            mso_shape = MSO_SHAPE.OVAL if 'ôvan' in sh['title'].lower() else MSO_SHAPE.ROUNDED_RECTANGLE
+                        # A. OVAL (type 8)
+                        if t_id == 8:
+                            x_in = trans[4] / 36576.0
+                            y_in = trans[5] / 36576.0
+                            w_in = trans[0] * 120000.0 / 36576.0
+                            h_in = trans[3] * 120000.0 / 36576.0
+                            fill_hex = pd.get(15) or ('#EAF4F6' if bg_color_hex == '#FFFFFF' else '#0E7C8C')
+                            opacity = float(pd.get(16, 1.0)) if isinstance(pd.get(16), (int, float)) else 1.0
                             try:
                                 new_shape = slide.shapes.add_shape(
-                                    mso_shape,
+                                    MSO_SHAPE.OVAL,
                                     PptxInches(x_in), PptxInches(y_in),
                                     PptxInches(w_in), PptxInches(h_in)
                                 )
@@ -1369,36 +1395,41 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                             except Exception:
                                 pass
 
-                    # E. Thêm các Hình ảnh minh họa riêng biệt (Picture shape PNG trong suốt)
-                    used_img_m_ids = set()
-                    for sh in hp_shapes:
-                        if sh['role'] == 'img':
-                            x_in = sh['left'] * scale_x
-                            y_in = sh['top'] * scale_y
-                            w_in = sh['w'] * scale_x
-                            h_in = sh['h'] * scale_y
+                        # B. ROUNDED RECTANGLE (type 7)
+                        elif t_id == 7:
+                            x_in = trans[4] / 36576.0
+                            y_in = trans[5] / 36576.0
+                            w_in = trans[0] * 120000.0 / 36576.0
+                            h_in = trans[3] * 120000.0 / 36576.0
+                            fill_hex = pd.get(15) or ('#EAF4F6' if bg_color_hex == '#FFFFFF' else '#0E7C8C')
+                            opacity = float(pd.get(16, 1.0)) if isinstance(pd.get(16), (int, float)) else 1.0
+                            radius = pd.get(0, 0)
+                            try:
+                                new_shape = slide.shapes.add_shape(
+                                    MSO_SHAPE.ROUNDED_RECTANGLE,
+                                    PptxInches(x_in), PptxInches(y_in),
+                                    PptxInches(w_in), PptxInches(h_in)
+                                )
+                                new_shape.line.fill.background()
+                                new_shape.fill.solid()
+                                new_shape.fill.fore_color.rgb = _hex_to_pptx_rgb(fill_hex)
+                                _apply_shape_opacity(new_shape, opacity)
+                                if radius > 0:
+                                    adj_val = min(0.5, max(0.04, radius / 100000.0))
+                                    new_shape.adjustments[0] = adj_val
+                            except Exception:
+                                pass
 
-                            matched_img_m = None
-                            best_dist = 999999
-                            for m in model_elements:
-                                if m['type'] == 3 and m['id'] not in used_img_m_ids:
-                                    m_x = m['trans'][4] / 36576.0
-                                    m_y = m['trans'][5] / 36576.0
-                                    dist = (x_in - m_x)**2 + (y_in - m_y)**2
-                                    if dist < best_dist:
-                                        best_dist = dist
-                                        matched_img_m = m
-
-                            img_bytes = None
-                            if matched_img_m:
-                                used_img_m_ids.add(matched_img_m['id'])
-                                props = matched_img_m['props']
-                                for idx_p, p in enumerate(props):
-                                    if p == 49 and idx_p + 1 < len(props):
-                                        b_id = props[idx_p + 1]
-                                        img_bytes = downloaded_images.get(b_id)
-                                        break
-
+                        # C. IMAGE (type 3)
+                        elif t_id == 3:
+                            x_in = trans[4] / 36576.0
+                            y_in = trans[5] / 36576.0
+                            img_w = pd.get(8, 720)
+                            img_h = pd.get(9, 720)
+                            w_in = trans[0] * img_w / 36576.0
+                            h_in = trans[3] * img_h / 36576.0
+                            blob_id = pd.get(49)
+                            img_bytes = downloaded_images.get(blob_id)
                             if img_bytes:
                                 try:
                                     slide.shapes.add_picture(
@@ -1409,104 +1440,69 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                                 except Exception:
                                     pass
 
-                    # F. Thêm các Hộp Text Box riêng biệt (văn bản giữ đúng font, màu, kích thước, bold/italic)
-                    slide_texts = []
-                    for sh in hp_shapes:
-                        if not sh['text']:
-                            continue
-                        slide_texts.append(sh['text'])
-
-                        x_in = max(0.0, sh['left'] * scale_x)
-                        y_in = max(0.0, sh['top'] * scale_y)
-                        w_in = max(0.2, sh['w'] * scale_x)
-                        h_in = max(0.2, sh['h'] * scale_y)
-
-                        tb = slide.shapes.add_textbox(PptxInches(x_in), PptxInches(y_in), PptxInches(w_in), PptxInches(h_in))
-                        _pptx_set_transparent_fill(tb)
-                        tf = tb.text_frame
-                        tf.word_wrap = True
-                        tf.margin_left = PptxInches(0.02)
-                        tf.margin_right = PptxInches(0.02)
-                        tf.margin_top = PptxInches(0.01)
-                        tf.margin_bottom = PptxInches(0.01)
-
-                        shape_el = sh['el']
-                        paragraphs = shape_el.find_all('p') or [shape_el]
-                        para_index = 0
-
-                        for p_el in paragraphs:
-                            p_style = _parse_css_dict(p_el.get('style', ''))
-                            ta = p_style.get('text-align', 'left')
-                            p_fs = _parse_pt(p_style.get('font-size'), 14.0)
-                            p_fw = p_style.get('font-weight', '400')
-                            p_bold = (p_fw in ['bold', '700', '800', '900'] or (p_fw.isdigit() and int(p_fw) >= 700))
-                            p_italic = (p_style.get('font-style') == 'italic')
-                            p_color = _parse_css_color_rgb(p_style.get('color'))
-                            p_ff = p_style.get('font-family', 'Arial').strip('\'"')
-
-                            runs_data = []
-                            children = list(p_el.children) if hasattr(p_el, 'children') else [p_el]
-                            if not children:
-                                children = [p_el]
-
-                            for child in children:
-                                if isinstance(child, NavigableString):
-                                    raw_text = str(child).replace('\ufffd', '\n').replace('\u000b', '\n').replace('\r', '')
-                                    if raw_text:
-                                        runs_data.append({
-                                            'text': raw_text,
-                                            'size': p_fs,
-                                            'bold': p_bold,
-                                            'italic': p_italic,
-                                            'color': p_color,
-                                            'font': p_ff
-                                        })
-                                elif isinstance(child, Tag):
-                                    raw_text = child.get_text().replace('\ufffd', '\n').replace('\u000b', '\n').replace('\r', '')
-                                    if not raw_text:
-                                        continue
-                                    c_style = _parse_css_dict(child.get('style', ''))
-                                    c_fs = _parse_pt(c_style.get('font-size'), p_fs)
-                                    c_fw = c_style.get('font-weight', p_fw)
-                                    c_bold = (c_fw in ['bold', '700', '800', '900'] or (c_fw.isdigit() and int(c_fw) >= 700))
-                                    c_italic = (c_style.get('font-style') == 'italic') if 'font-style' in c_style else p_italic
-                                    c_color = _parse_css_color_rgb(c_style.get('color')) or p_color
-                                    c_ff = c_style.get('font-family', p_ff).strip('\'"')
-
-                                    runs_data.append({
-                                        'text': raw_text,
-                                        'size': c_fs,
-                                        'bold': c_bold,
-                                        'italic': c_italic,
-                                        'color': c_color,
-                                        'font': c_ff
-                                    })
-
-                            if not runs_data:
+                        # D. TEXT (type 6)
+                        elif t_id == 6:
+                            if text_ptr >= len(html_texts):
                                 continue
+                            html_shape = html_texts[text_ptr]
+                            text_ptr += 1
 
-                            p_para = tf.paragraphs[0] if para_index == 0 else tf.add_paragraph()
-                            para_index += 1
+                            x_in = max(0.0, trans[4] / 36576.0)
+                            y_in = max(0.0, trans[5] / 36576.0)
+                            w_in = max(0.2, trans[0] * 120000.0 / 36576.0)
+                            h_in = max(0.2, trans[3] * 120000.0 / 36576.0)
 
-                            if ta == 'center':
-                                p_para.alignment = PP_ALIGN.CENTER
-                            elif ta == 'right':
-                                p_para.alignment = PP_ALIGN.RIGHT
-                            elif ta == 'justify':
-                                p_para.alignment = PP_ALIGN.JUSTIFY
+                            tb = slide.shapes.add_textbox(PptxInches(x_in), PptxInches(y_in), PptxInches(w_in), PptxInches(h_in))
+                            _pptx_set_transparent_fill(tb)
+                            tf = tb.text_frame
+                            tf.word_wrap = True
+
+                            # Margins from property 53
+                            padding = pd.get(53)
+                            if isinstance(padding, list) and len(padding) == 4:
+                                tf.margin_top = PptxInches(padding[0] / 36576.0)
+                                tf.margin_right = PptxInches(padding[1] / 36576.0)
+                                tf.margin_bottom = PptxInches(padding[2] / 36576.0)
+                                tf.margin_left = PptxInches(padding[3] / 36576.0)
                             else:
-                                p_para.alignment = PP_ALIGN.LEFT
+                                tf.margin_left = PptxInches(0.05)
+                                tf.margin_right = PptxInches(0.05)
+                                tf.margin_top = PptxInches(0.02)
+                                tf.margin_bottom = PptxInches(0.02)
 
-                            for r_info in runs_data:
-                                run = p_para.add_run()
-                                run.text = r_info['text']
-                                run.font.size = PptxPt(r_info['size'])
-                                run.font.bold = r_info['bold']
-                                run.font.italic = r_info['italic']
-                                if r_info['font']:
-                                    run.font.name = r_info['font']
-                                if r_info['color']:
-                                    run.font.color.rgb = r_info['color']
+                            # Vertical alignment from property 44: 0=TOP, 1=MIDDLE, 2=BOTTOM
+                            v_align = pd.get(44, 0)
+                            if v_align == 1:
+                                tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+                            elif v_align == 2:
+                                tf.vertical_anchor = MSO_ANCHOR.BOTTOM
+                            else:
+                                tf.vertical_anchor = MSO_ANCHOR.TOP
+
+                            slide_texts.append(html_shape.get_text().strip())
+
+                            # Parse paragraphs and runs cleanly
+                            parsed_paras = _parse_html_shape_runs(html_shape)
+                            first_para = True
+
+                            for p_info in parsed_paras:
+                                p_para = tf.paragraphs[0] if first_para else tf.add_paragraph()
+                                first_para = False
+                                p_para.alignment = p_info['alignment']
+                                p_para.space_before = PptxPt(0)
+                                p_para.space_after = PptxPt(0)
+                                p_para.line_spacing = 1.15
+
+                                for r_info in p_info['runs']:
+                                    run = p_para.add_run()
+                                    run.text = r_info['text']
+                                    run.font.size = PptxPt(r_info['size'])
+                                    run.font.bold = r_info['bold']
+                                    run.font.italic = r_info['italic']
+                                    if r_info['font']:
+                                        run.font.name = r_info['font']
+                                    if r_info['color']:
+                                        run.font.color.rgb = r_info['color']
 
                     # G. Ghi chú Speaker Notes
                     if slide_texts:
@@ -1524,7 +1520,7 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
                 prs.save(output_path)
                 file_size_mb = os.path.getsize(output_path) / 1024 / 1024
                 log_cb(f"  ✓ Hoàn tất PPTX Tách đối tượng: {os.path.basename(output_path)} ({total} slide, {file_size_mb:.2f} MB)")
-                log_cb(f"  🌟 TÁCH BIỆT HOÀN TOÀN: Nền slide riêng + Khung shape vector riêng + Hình ảnh riêng + Text layer chỉnh sửa 100%!")
+                log_cb(f"  🌟 TÁCH BIỆT HOÀN TOÀN: Nền slide riêng + Khung shape vector riêng + Hình ảnh riêng + Text layer chuẩn 100%!")
                 return output_path
     except Exception as e:
         log_cb(f"  ⚠ Lỗi phương pháp tách đối tượng: {e}. Đang chuyển sang phương thức dự phòng...")
