@@ -1090,23 +1090,46 @@ def download_single_presentation_pptx(url: str, output_path: str, scale: int = 2
     return output_path
 
 
-def download_single_presentation_pptx_editable(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
-    """Tạo PPTX lai: hình ảnh nền chất lượng cao + text layer trong suốt chỉnh sửa được + Speaker Notes đầy đủ"""
-    doc_id, _ = extract_id_and_type(url)
-    log_cb(f"  [PPTX Editable] Đang khởi tạo PowerPoint chỉnh sửa được cho: {doc_id}")
+def _set_slide_background_image(slide, image_bytes: bytes) -> bool:
+    """Dat hinh anh lam NEN slide (khong phai shape). Text box tren do la shape duy nhat, de click/edit."""
+    try:
+        img_part, rId = slide.part.get_or_add_image_part(io.BytesIO(image_bytes))
+        sld = slide._element
+        cSld = sld.find(pptx_qn('p:cSld'))
+        if cSld is None:
+            return False
+        for old in list(cSld.findall(pptx_qn('p:bg'))):
+            cSld.remove(old)
+        bg = etree.Element(pptx_qn('p:bg'))
+        bgPr = etree.SubElement(bg, pptx_qn('p:bgPr'))
+        blipFill = etree.SubElement(bgPr, pptx_qn('a:blipFill'))
+        blip = etree.SubElement(blipFill, pptx_qn('a:blip'))
+        blip.set(pptx_qn('r:embed'), rId)
+        stretch = etree.SubElement(blipFill, pptx_qn('a:stretch'))
+        etree.SubElement(stretch, pptx_qn('a:fillRect'))
+        etree.SubElement(bgPr, pptx_qn('a:effectLst'))
+        spTree = cSld.find(pptx_qn('p:spTree'))
+        idx_insert = list(cSld).index(spTree) if spTree is not None else len(list(cSld))
+        cSld.insert(idx_insert, bg)
+        return True
+    except Exception:
+        return False
 
-    # Bước 1: Lấy hình ảnh slide
+
+def download_single_presentation_pptx_editable(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
+    """Tao PPTX thuc su chinh sua duoc: hinh anh lam NEN slide + text box hien thi ro rang + Speaker Notes"""
+    doc_id, _ = extract_id_and_type(url)
+    log_cb(f"  [PPTX Editable] Bat dau tao PPTX text chinh sua duoc cho: {doc_id}")
+
     slide_images = asyncio.run(extract_slides_from_google_presentation(url, scale=scale, log_cb=log_cb))
     total_slides = len(slide_images)
 
-    # Bước 2: Lấy text từng slide
-    log_cb(f"  [PPTX Editable] Đang trích xuất text từng slide...")
+    log_cb(f"  [PPTX Editable] Dang trich xuat text tung slide tu htmlpresent...")
     slide_texts = extract_slide_texts_from_presentation(url, log_cb=log_cb)
 
-    log_cb(f"  [PPTX Editable] Đang đóng gói {total_slides} slide với text layer...")
+    log_cb(f"  [PPTX Editable] Dang tao {total_slides} slide voi text hien thi duoc...")
     prs = Presentation()
 
-    # Nhận diện tỷ lệ khung hình
     first_img = Image.open(io.BytesIO(slide_images[0]))
     aspect = first_img.width / first_img.height if first_img.height > 0 else 1.777
     if aspect > 1.5:
@@ -1120,66 +1143,78 @@ def download_single_presentation_pptx_editable(url: str, output_path: str, scale
 
     for idx, img_b in enumerate(slide_images):
         slide = prs.slides.add_slide(blank_layout)
-
-        # --- Lớp 1: Hình ảnh nền toàn trang ---
-        slide.shapes.add_picture(
-            io.BytesIO(img_b),
-            0, 0,
-            width=prs.slide_width,
-            height=prs.slide_height
-        )
-
-        # --- Lớp 2: Text box trong suốt, phủ toàn slide ---
         texts = slide_texts[idx] if idx < len(slide_texts) else []
-        if texts:
-            text_content = '\n'.join(texts)
+        meaningful = [t.strip() for t in texts if len(t.strip()) > 1]
 
-            # Text box phủ phần lớn slide (để dành 5% margin)
-            margin = PptxInches(0.3)
-            txBox = slide.shapes.add_textbox(
-                margin,
-                margin,
-                prs.slide_width - margin * 2,
-                prs.slide_height - margin * 2
-            )
+        # Phat hien nen toi hay sang de chon mau text
+        try:
+            thumb = Image.open(io.BytesIO(img_b)).convert('L').resize((32, 18))
+            avg_brightness = sum(thumb.getdata()) / (32 * 18)
+            is_dark = avg_brightness < 140
+        except Exception:
+            is_dark = True
+        txt_color = PptxRGB(0xFF, 0xFF, 0xFF) if is_dark else PptxRGB(0x11, 0x11, 0x22)
 
-            # Làm cho text box trong suốt hoàn toàn (không có fill, không có border)
-            _pptx_set_transparent_fill(txBox)
+        # Dat anh lam NEN slide (khong phai shape) -> cac text box la shape duy nhat de click/edit
+        bg_ok = _set_slide_background_image(slide, img_b)
+        if not bg_ok:
+            # Fallback: picture shape
+            slide.shapes.add_picture(io.BytesIO(img_b), 0, 0,
+                                     width=prs.slide_width, height=prs.slide_height)
 
-            tf = txBox.text_frame
+        if not meaningful:
+            continue
+
+        margin = PptxInches(0.35)
+        sw, sh = prs.slide_width, prs.slide_height
+        title_lines = meaningful[:2]
+        body_lines = meaningful[2:]
+
+        # === Text box 1: Tieu de (lon, dam) ===
+        title_h = PptxInches(min(1.8, 0.55 * len(title_lines) + 0.5))
+        tb_t = slide.shapes.add_textbox(margin, margin, sw - 2 * margin, title_h)
+        _pptx_set_transparent_fill(tb_t)
+        tf = tb_t.text_frame
+        tf.word_wrap = True
+        for i, line in enumerate(title_lines):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            run = p.add_run()
+            run.text = line
+            run.font.size = PptxPt(28 if i == 0 else 20)
+            run.font.bold = (i == 0)
+            run.font.color.rgb = txt_color
+
+        # === Text box 2: Noi dung ===
+        if body_lines:
+            body_top = margin + title_h + PptxInches(0.15)
+            body_h = sh - body_top - margin
+            bfp = max(10, min(18, 500 // max(sum(len(l) for l in body_lines), 10)))
+            tb_b = slide.shapes.add_textbox(margin, body_top, sw - 2 * margin, body_h)
+            _pptx_set_transparent_fill(tb_b)
+            tf = tb_b.text_frame
             tf.word_wrap = True
-            tf.auto_size = None
-
-            # Xóa paragraph mặc định và thêm từng dòng
-            tf.clear()
-            for i, line in enumerate(texts):
-                if i == 0:
-                    p = tf.paragraphs[0]
-                else:
-                    p = tf.add_paragraph()
+            for i, line in enumerate(body_lines):
+                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
                 run = p.add_run()
                 run.text = line
-                # Font: nhỏ (7pt), màu trắng -> vô hình trên nền sáng, nhưng text vẫn selecteable
-                run.font.size = PptxPt(7)
-                run.font.color.rgb = PptxRGB(0xFF, 0xFF, 0xFF)  # trắng
-                run.font.bold = False
+                run.font.size = PptxPt(bfp)
+                run.font.color.rgb = txt_color
 
-            # --- Lớp 3: Speaker Notes (text đầy đủ, dễ đọc) ---
-            try:
-                notes_slide = slide.notes_slide
-                notes_tf = notes_slide.notes_text_frame
-                notes_tf.clear()
-                notes_tf.text = f"[Slide {idx + 1}]\n" + text_content
-                for para in notes_tf.paragraphs:
-                    for run in para.runs:
-                        run.font.size = PptxPt(11)
-            except Exception:
-                pass
+        # === Speaker Notes: toan bo text day du ===
+        try:
+            notes_tf = slide.notes_slide.notes_text_frame
+            notes_tf.clear()
+            notes_tf.text = f"[Slide {idx + 1}]\n" + '\n'.join(meaningful)
+            for para in notes_tf.paragraphs:
+                for run in para.runs:
+                    run.font.size = PptxPt(12)
+        except Exception:
+            pass
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     prs.save(output_path)
-    log_cb(f"  ✓ Đã xuất PPTX Editable: {os.path.basename(output_path)} ({total_slides} slide, {os.path.getsize(output_path)/1024:.1f} KB)")
-    log_cb(f"  💡 Mẹo: Mở file trong PowerPoint → Click vào slide → Ctrl+A để chọn/copy toàn bộ text. Xem thêm ở khung 'Ghi chú' (Notes) bên dưới.")
+    log_cb(f"  Da xuat PPTX Editable: {os.path.basename(output_path)} ({total_slides} slide, {os.path.getsize(output_path)/1024:.1f} KB)")
+    log_cb(f"  TIPS: Mo PowerPoint -> Click slide -> text box chinh sua duoc. Ctrl+A chon tat ca. Tab 'Notes' co toan bo text.")
     return output_path
 
 
