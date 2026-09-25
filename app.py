@@ -22,7 +22,10 @@ from downloader_core import (
     scan_google_drive_folder,
     download_single_docx,
     download_single_pdf,
-    download_drive_pdf
+    download_drive_pdf,
+    download_single_presentation_pptx,
+    download_single_presentation_pptx_editable,
+    download_single_presentation_pdf
 )
 
 if sys.platform == 'win32':
@@ -88,12 +91,13 @@ def api_scan():
     data = request.json or {}
     url = data.get("url", "").strip()
     if not url:
-        return jsonify({"error": "Vui lòng nhập đường link Google Drive / Docs"}), 400
+        return jsonify({"error": "Vui lòng nhập đường link Google Drive / Docs / Slides"}), 400
 
     target_id, link_type = extract_id_and_type(url)
     log_message(f"Nhận yêu cầu quét: {url} (Loại: {link_type})")
 
     try:
+        # 1. Thư mục Google Drive
         if link_type == "folder":
             items = asyncio.run(scan_google_drive_folder(url, log_cb=lambda m: log_message(m, "info")))
             folder_title = f"Thư mục Drive ({len(items)} tệp)"
@@ -103,9 +107,41 @@ def api_scan():
                 "title": folder_title,
                 "items": items
             })
+
+        # 2. Google Slides / Bài thuyết trình
+        elif link_type == "presentation":
+            doc_name = "Bài thuyết trình Google Slides"
+            try:
+                r = requests.get(f"https://docs.google.com/presentation/d/{target_id}/htmlpresent", headers={'User-Agent': 'Mozilla/5.0'}, timeout=6)
+                soup = BeautifulSoup(r.text, 'html.parser')
+                if soup.title and soup.title.string:
+                    raw = soup.title.string.replace(" - Google Trang trình bày", "").replace(" - Google Slides", "").strip()
+                    if raw:
+                        doc_name = raw
+            except Exception:
+                pass
+
+            item = {
+                "id": target_id,
+                "name": doc_name,
+                "isFolder": False,
+                "isPdf": False,
+                "isPresentation": True,
+                "url": f"https://docs.google.com/presentation/d/{target_id}/edit"
+            }
+            log_message(f"Phát hiện Google Slides: {doc_name} (ID: {target_id})", "success")
+            return jsonify({
+                "type": "presentation",
+                "folderId": None,
+                "title": doc_name,
+                "items": [item]
+            })
+
+        # 3. Tệp Google Drive File (PDF, PPTX, DOCX)
         elif link_type == "drive_file" or "drive.google.com/file" in url:
             doc_name = "Tệp Google Drive"
-            is_pdf = True
+            is_pdf = False
+            is_presentation = False
             try:
                 r = requests.get(f"https://drive.google.com/file/d/{target_id}/preview", headers={'User-Agent': 'Mozilla/5.0'}, timeout=6)
                 soup = BeautifulSoup(r.text, 'html.parser')
@@ -113,7 +149,9 @@ def api_scan():
                     raw = soup.title.string.replace(" - Google Drive", "").strip()
                     if raw:
                         doc_name = raw
-                        is_pdf = doc_name.lower().endswith('.pdf') or 'pdf' in raw.lower()
+                        raw_lower = raw.lower()
+                        is_presentation = raw_lower.endswith('.pptx') or raw_lower.endswith('.ppt') or 'pptx' in raw_lower or 'trình bày' in raw_lower
+                        is_pdf = raw_lower.endswith('.pdf') or 'pdf' in raw_lower
             except Exception:
                 pass
 
@@ -122,15 +160,19 @@ def api_scan():
                 "name": doc_name,
                 "isFolder": False,
                 "isPdf": is_pdf,
+                "isPresentation": is_presentation,
                 "url": f"https://drive.google.com/file/d/{target_id}/view"
             }
-            log_message(f"Phát hiện tệp Google Drive: {doc_name} (ID: {target_id})", "success")
+            item_type = "presentation" if is_presentation else ("pdf" if is_pdf else "file")
+            log_message(f"Phát hiện tệp Google Drive: {doc_name} (Loại: {item_type}, ID: {target_id})", "success")
             return jsonify({
-                "type": "pdf" if is_pdf else "file",
+                "type": item_type,
                 "folderId": None,
                 "title": doc_name,
                 "items": [item]
             })
+
+        # 4. Google Docs
         else:
             doc_name = "Tài liệu Google Docs"
             try:
@@ -148,6 +190,7 @@ def api_scan():
                 "name": doc_name,
                 "isFolder": False,
                 "isPdf": False,
+                "isPresentation": False,
                 "url": f"https://docs.google.com/document/d/{target_id}/edit"
             }
             log_message(f"Phát hiện tệp Google Docs: {doc_name} (ID: {target_id})", "success")
@@ -189,10 +232,30 @@ def background_downloader(items, output_dir, fmt, scale, quality):
             item_id = it["id"]
             raw_name = it.get("name", "Document")
             clean_name = sanitize_filename(raw_name)
-            is_pdf_file = it.get("isPdf", False) or clean_name.lower().endswith(".pdf") or "drive.google.com/file" in it.get("url", "")
+            
+            # Skip subfolders if any
+            if it.get("isFolder", False) or "/drive/folders/" in it.get("url", ""):
+                log_message(f"⚠️ Bỏ qua thư mục con: {raw_name}", "warning")
+                with state_lock:
+                    current_task["item_status"][item_id] = {"status": "completed", "error_msg": "Bỏ qua thư mục con"}
+                broadcast_event("item_update", {"id": item_id, "status": "completed"})
+                continue
+
+            clean_lower = clean_name.lower()
+            is_presentation = it.get("isPresentation", False) or clean_lower.endswith(".pptx") or clean_lower.endswith(".ppt") or "presentation" in it.get("url", "")
+            is_pdf_file = (not is_presentation) and (it.get("isPdf", False) or clean_lower.endswith(".pdf"))
+            is_drive_file = (not is_presentation) and (not is_pdf_file) and (
+                it.get("isDriveFile", False) or 
+                "drive.google.com/file" in it.get("url", "") or 
+                any(clean_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".zip", ".rar", ".7z", ".mp4", ".mp3", ".wav"])
+            )
             
             if clean_name.lower().endswith(".docx"):
                 base_name = clean_name[:-5]
+            elif clean_name.lower().endswith(".pptx"):
+                base_name = clean_name[:-5]
+            elif clean_name.lower().endswith(".ppt"):
+                base_name = clean_name[:-4]
             elif clean_name.lower().endswith(".pdf"):
                 base_name = clean_name[:-4]
             else:
@@ -218,8 +281,40 @@ def background_downloader(items, output_dir, fmt, scale, quality):
             item_failed = False
             error_details = ""
 
-            # A. Xử lý tệp PDF từ Drive Viewer
-            if is_pdf_file:
+            # A. Xử lý Google Slides / PowerPoint (.pptx)
+            if is_presentation:
+                # 1. Tải PPTX Editable (hình ảnh nền + text layer chỉnh sửa được)
+                if fmt == "pptx_text":
+                    editable_path = os.path.join(output_dir, f"{base_name}_editable.pptx")
+                    try:
+                        download_single_presentation_pptx_editable(it["url"], editable_path, scale=scale, quality=quality, log_cb=lambda m: log_message(m, "info"))
+                    except Exception as e:
+                        item_failed = True
+                        error_details += f"PPTX Editable lỗi: {str(e)}; "
+                        log_message(f"❌ Lỗi tạo PPTX Editable cho '{raw_name}': {e}", "error")
+
+                # 2. Tải PPTX hình ảnh (khi chọn PPTX, Word DOCX, hoặc All)
+                elif fmt in ["pptx", "docx", "all"]:
+                    pptx_path = os.path.join(output_dir, f"{base_name}.pptx")
+                    try:
+                        download_single_presentation_pptx(it["url"], pptx_path, scale=scale, quality=quality, log_cb=lambda m: log_message(m, "info"))
+                    except Exception as e:
+                        item_failed = True
+                        error_details += f"PPTX lỗi: {str(e)}; "
+                        log_message(f"❌ Lỗi tải PPTX cho '{raw_name}': {e}", "error")
+
+                # 3. Tải PDF cho slide nếu chọn PDF hoặc All
+                if fmt in ["pdf", "all"] and not item_failed:
+                    pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+                    try:
+                        download_single_presentation_pdf(it["url"], pdf_path, scale=scale, quality=quality, log_cb=lambda m: log_message(m, "info"))
+                    except Exception as e:
+                        item_failed = True
+                        error_details += f"PDF lỗi: {str(e)}; "
+                        log_message(f"❌ Lỗi tải PDF Slide cho '{raw_name}': {e}", "error")
+
+            # B. Xử lý tệp PDF từ Drive Viewer
+            elif is_pdf_file:
                 pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
                 try:
                     asyncio.run(download_drive_pdf(it["url"], pdf_path, quality=quality, log_cb=lambda m: log_message(m, "info")))
@@ -228,10 +323,39 @@ def background_downloader(items, output_dir, fmt, scale, quality):
                     error_details = f"Lỗi tải Drive PDF: {str(e)}"
                     log_message(f"❌ {error_details}", "error")
 
-            # B. Xử lý tệp Google Docs
+            # C. Xử lý tệp Drive / Hình ảnh / File nhị phân
+            elif is_drive_file:
+                file_path = os.path.join(output_dir, clean_name)
+                try:
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                    dl_url = f"https://drive.usercontent.google.com/download?id={item_id}&export=download"
+                    r = requests.get(dl_url, headers=headers, stream=True, timeout=30)
+                    if r.status_code == 200:
+                        with open(file_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=65536):
+                                if chunk:
+                                    f.write(chunk)
+                        log_message(f"  ✓ Đã tải tệp Drive: {clean_name}", "success")
+                    else:
+                        alt_url = f"https://drive.google.com/uc?export=download&id={item_id}"
+                        r2 = requests.get(alt_url, headers=headers, stream=True, timeout=30)
+                        if r2.status_code == 200 and "html" not in r2.headers.get("content-type", "").lower():
+                            with open(file_path, "wb") as f:
+                                for chunk in r2.iter_content(chunk_size=65536):
+                                    if chunk:
+                                        f.write(chunk)
+                            log_message(f"  ✓ Đã tải tệp Drive: {clean_name}", "success")
+                        else:
+                            raise Exception(f"Không thể tải tệp Drive (HTTP {r.status_code})")
+                except Exception as e:
+                    item_failed = True
+                    error_details = f"Lỗi tải tệp: {str(e)}"
+                    log_message(f"❌ {error_details}", "error")
+
+            # D. Xử lý tệp Google Docs
             else:
-                # 1. Tải DOCX
-                if fmt in ["docx", "all"]:
+                # 1. Tải DOCX (khi chọn DOCX, PPTX, hoặc All để đảm bảo tải đúng định dạng của tệp trong thư mục)
+                if fmt in ["docx", "pptx", "all"]:
                     docx_path = os.path.join(output_dir, f"{base_name}.docx")
                     try:
                         download_single_docx(it["url"], docx_path, log_cb=lambda m: log_message(m, "info"))
@@ -240,7 +364,7 @@ def background_downloader(items, output_dir, fmt, scale, quality):
                         error_details += f"DOCX lỗi: {str(e)}; "
                         log_message(f"❌ Lỗi tải DOCX cho '{raw_name}': {e}", "error")
 
-                # 2. Tải PDF
+                # 2. Tải PDF nếu chọn PDF hoặc All
                 if fmt in ["pdf", "all"] and not item_failed:
                     pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
                     try:
@@ -343,14 +467,19 @@ def api_events():
 @app.route("/api/browse-directory", methods=["POST"])
 def api_browse_directory():
     """Mở hộp thoại chọn thư mục Windows với Win32 Native Shell / Subprocess"""
+    data = request.json or {}
+    initial_dir = data.get("initialDir", "").strip() or DEFAULT_DOWNLOAD_DIR
     picker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "win32_folder_picker.py")
     try:
+        cmd = [sys.executable, picker_script]
+        if initial_dir and os.path.exists(initial_dir):
+            cmd.append(initial_dir)
         res = subprocess.run(
-            [sys.executable, picker_script],
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=40
+            timeout=60
         )
         selected_path = res.stdout.strip()
         if selected_path and os.path.isdir(selected_path):
@@ -367,19 +496,22 @@ def api_browse_directory():
 def api_open_folder():
     data = request.json or {}
     path = data.get("path", "").strip() or DEFAULT_DOWNLOAD_DIR
-    os.makedirs(path, exist_ok=True)
-    if os.path.exists(path):
-        try:
-            if sys.platform == 'win32':
-                os.startfile(path)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', path])
-            else:
-                subprocess.Popen(['xdg-open', path])
-            return jsonify({"success": True})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    return jsonify({"error": "Thư mục không tồn tại"}), 404
+    try:
+        norm_path = os.path.abspath(os.path.normpath(path))
+        os.makedirs(norm_path, exist_ok=True)
+        if sys.platform == 'win32':
+            try:
+                os.startfile(norm_path)
+            except Exception:
+                subprocess.Popen(['explorer', norm_path])
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', norm_path])
+        else:
+            subprocess.Popen(['xdg-open', norm_path])
+        return jsonify({"success": True, "path": norm_path})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 def open_browser_delayed():

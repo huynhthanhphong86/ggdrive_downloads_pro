@@ -1,13 +1,15 @@
 """
-Core Module for Google Drive & Google Docs View-Only Downloader
+Core Module for Google Drive, Google Docs & Google Slides View-Only Downloader
 Hỗ trợ:
 1. Quét thư mục Google Drive (Folder Scanning)
 2. Tải tài liệu Google Docs sang .DOCX và .PDF
-3. Tải tệp PDF View-Only từ Google Drive Viewer sang .PDF chuẩn 100% (hỗ trợ mọi số lượng trang)
+3. Tải bài thuyết trình Google Slides / PPTX sang .PPTX và .PDF
+4. Tải tệp PDF View-Only từ Google Drive Viewer sang .PDF chuẩn 100% (hỗ trợ mọi số lượng trang)
 """
 
 import os
 import sys
+import json
 import re
 import io
 import time
@@ -25,13 +27,18 @@ from docx.oxml.ns import qn
 from playwright.async_api import async_playwright
 import pymupdf
 from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches as PptxInches, Pt as PptxPt
+from pptx.dml.color import RGBColor as PptxRGB
+from pptx.oxml.ns import qn as pptx_qn
+from lxml import etree
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
 
 def extract_id_and_type(url: str) -> tuple:
-    """Xác định ID và loại liên kết (folder, doc, pdf, file)"""
+    """Xác định ID và loại liên kết (folder, doc, presentation, pdf, drive_file)"""
     url = url.strip()
     
     # 1. Google Drive Folder
@@ -39,12 +46,17 @@ def extract_id_and_type(url: str) -> tuple:
     if folder_match:
         return folder_match.group(1), "folder"
     
-    # 2. Google Docs
+    # 2. Google Slides / Presentation
+    presentation_match = re.search(r"docs\.google\.com/presentation/(?:u/\d+/)?d/([a-zA-Z0-9-_]+)", url)
+    if presentation_match:
+        return presentation_match.group(1), "presentation"
+
+    # 3. Google Docs
     doc_match = re.search(r"docs\.google\.com/document/(?:u/\d+/)?d/([a-zA-Z0-9-_]+)", url)
     if doc_match:
         return doc_match.group(1), "doc"
         
-    # 3. Google Drive File (PDF hoặc Docx)
+    # 4. Google Drive File (PDF, PPTX hoặc Docx)
     file_match = re.search(r"drive\.google\.com/file/(?:u/\d+/)?d/([a-zA-Z0-9-_]+)", url)
     if file_match:
         file_id = file_match.group(1)
@@ -94,16 +106,41 @@ async def scan_google_drive_folder(folder_url: str, log_cb=print) -> list:
                         }
                         
                         if (name && !foundItems.has(id)) {
+                            const nameLower = name.toLowerCase();
+                            const labelLower = label.toLowerCase();
+
                             const isFolder = el.querySelector('[data-is-folder="true"]') !== null || 
-                                             label.toLowerCase().includes('thư mục') || 
-                                             label.toLowerCase().includes('folder');
+                                             labelLower.includes('thư mục') || 
+                                             labelLower.includes('folder');
                             
-                            const isPdf = name.toLowerCase().endsWith('.pdf') || label.toLowerCase().includes('.pdf');
+                            const isPdf = nameLower.endsWith('.pdf') || labelLower.includes('.pdf');
+                            const isPresentation = nameLower.endsWith('.pptx') || 
+                                                   nameLower.endsWith('.ppt') || 
+                                                   labelLower.includes('.pptx') || 
+                                                   labelLower.includes('.ppt') || 
+                                                   labelLower.includes('trang trình bày') || 
+                                                   labelLower.includes('presentation') || 
+                                                   labelLower.includes('slide');
+
+                            const isDriveFile = !isPresentation && !isPdf && !isFolder && (
+                                nameLower.endsWith('.jpg') || 
+                                nameLower.endsWith('.jpeg') || 
+                                nameLower.endsWith('.png') || 
+                                nameLower.endsWith('.webp') || 
+                                nameLower.endsWith('.gif') || 
+                                nameLower.endsWith('.bmp') || 
+                                nameLower.endsWith('.zip') || 
+                                nameLower.endsWith('.rar') || 
+                                nameLower.endsWith('.mp4') || 
+                                nameLower.endsWith('.mp3')
+                            );
                             
                             let fileUrl = `https://docs.google.com/document/d/${id}/edit`;
                             if (isFolder) {
                                 fileUrl = `https://drive.google.com/drive/folders/${id}`;
-                            } else if (isPdf) {
+                            } else if (isPresentation) {
+                                fileUrl = `https://docs.google.com/presentation/d/${id}/edit`;
+                            } else if (isPdf || isDriveFile) {
                                 fileUrl = `https://drive.google.com/file/d/${id}/view`;
                             }
                             
@@ -112,6 +149,8 @@ async def scan_google_drive_folder(folder_url: str, log_cb=print) -> list:
                                 name: name,
                                 isFolder: isFolder,
                                 isPdf: isPdf,
+                                isPresentation: isPresentation,
+                                isDriveFile: isDriveFile,
                                 url: fileUrl
                             });
                         }
@@ -147,8 +186,85 @@ async def scan_google_drive_folder(folder_url: str, log_cb=print) -> list:
 
 
 # --- DRIVE PDF DOWNLOADER (NETWORK INTERCEPTION & ADAPTIVE SCROLLING) ---
+def get_system_ttf_font() -> str:
+    """Tìm font TrueType hỗ trợ đầy đủ Unicode / Tiếng Việt trên hệ thống"""
+    candidates = [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/times.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def group_words_into_segments(words_list):
+    """Gom các từ liền kề trên cùng một dòng thành các cụm từ (phrase segments) chuẩn theo từng cột"""
+    if not words_list:
+        return []
+
+    # Sắp xếp các từ theo thứ tự: từ trên xuống dưới, từ trái sang phải
+    sorted_words = sorted(words_list, key=lambda w: (round(float(w[0][0]) / 3.0), float(w[0][1])))
+
+    segments = []
+    current_seg = None
+
+    for box, text in sorted_words:
+        y, x, h, w = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        if not text.strip():
+            continue
+
+        if current_seg is None:
+            current_seg = {
+                'y': y,
+                'x': x,
+                'h': h,
+                'w': w,
+                'words': [text.strip()],
+                'last_x_end': x + w
+            }
+        else:
+            # Kiểm tra xem từ tiếp theo có nằm trên cùng dòng và gần từ trước (cùng ô / cùng cột) không
+            same_line = abs(y - current_seg['y']) < 5.0
+            gap = x - current_seg['last_x_end']
+            
+            # Khoảng cách giữa 2 từ trong cùng một cụm < 20 pt. Nếu gap >= 20 pt -> Sang cột khác
+            if same_line and -5.0 <= gap < 20.0:
+                current_seg['words'].append(text.strip())
+                current_seg['w'] = (x + w) - current_seg['x']
+                current_seg['h'] = max(current_seg['h'], h)
+                current_seg['last_x_end'] = x + w
+            else:
+                segments.append({
+                    'box': [current_seg['y'], current_seg['x'], current_seg['h'], current_seg['w']],
+                    'text': ' '.join(current_seg['words'])
+                })
+                current_seg = {
+                    'y': y,
+                    'x': x,
+                    'h': h,
+                    'w': w,
+                    'words': [text.strip()],
+                    'last_x_end': x + w
+                }
+
+    if current_seg:
+        segments.append({
+            'box': [current_seg['y'], current_seg['x'], current_seg['h'], current_seg['w']],
+            'text': ' '.join(current_seg['words'])
+        })
+
+    return segments
+
+
+# --- DRIVE PDF DOWNLOADER (NETWORK INTERCEPTION & ADAPTIVE SCROLLING & TEXT LAYER) ---
 async def download_drive_pdf(file_url: str, output_path: str, quality: int = 92, log_cb=print) -> str:
-    """Tải tệp PDF View-Only từ Google Drive Viewer đầy đủ 100% các trang"""
+    """Tải tệp PDF View-Only từ Google Drive Viewer với đầy đủ hình ảnh siêu nét và Lớp Text Layer (Searchable/Selectable)"""
     doc_id, _ = extract_id_and_type(file_url)
     preview_url = f"https://drive.google.com/file/d/{doc_id}/preview"
     log_cb(f"  [PDF Viewer] Đang kết nối Google Drive PDF Viewer: {doc_id}")
@@ -158,10 +274,13 @@ async def download_drive_pdf(file_url: str, output_path: str, quality: int = 92,
         context = await browser.new_context(viewport={'width': 1800, 'height': 1200}, device_scale_factor=2)
         page = await context.new_page()
 
-        pages_captured = {} # page_idx (int) -> bytes
+        pages_captured = {}   # page_idx (int) -> image bytes
+        text_layers = {}      # page_idx (int) -> list of line dicts
+        page_dimensions = {}  # page_idx (int) -> (dpi, pt_height, pt_width)
 
         async def handle_response(res):
             url = res.url
+            # 1. Bắt hình ảnh hiển thị từng trang
             if 'viewer/img' in url and 'auditContext=forDisplay' in url:
                 parsed = urlparse(url)
                 qs = parse_qs(parsed.query)
@@ -175,6 +294,39 @@ async def download_drive_pdf(file_url: str, output_path: str, quality: int = 92,
                             log_cb(f"    ✓ Đã nạp Trang {page_idx + 1} ({len(body)/1024:.1f} KB)")
                     except Exception:
                         pass
+
+            # 2. Bắt Lớp Text Layer cấu trúc từ Google Drive Viewer
+            elif 'viewer/presspage' in url:
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                page_param = qs.get('page', [''])[0]
+                if page_param.isdigit():
+                    page_idx = int(page_param)
+                    try:
+                        raw = await res.text()
+                        start = raw.find('[')
+                        end = raw.rfind(']')
+                        if start != -1 and end != -1:
+                            data = json.loads(raw[start:end+1])
+                            # data structure: [dpi, height, width, lines_blocks]
+                            if len(data) >= 4:
+                                page_dimensions[page_idx] = (data[0], data[1], data[2])
+                                raw_words = []
+                                for block in data[3]:
+                                    if len(block) >= 2:
+                                        def extract_words(node):
+                                            if isinstance(node, list):
+                                                if len(node) == 2 and isinstance(node[0], list) and isinstance(node[1], str):
+                                                    raw_words.append((node[0], node[1]))
+                                                else:
+                                                    for item in node:
+                                                        extract_words(item)
+                                        extract_words(block[1])
+                                text_layers[page_idx] = group_words_into_segments(raw_words)
+                                log_cb(f"    ✓ Đã nạp Text Layer Trang {page_idx + 1} ({len(text_layers[page_idx])} phân đoạn)")
+                    except Exception:
+                        pass
+
 
         page.on("response", handle_response)
         
@@ -199,8 +351,8 @@ async def download_drive_pdf(file_url: str, output_path: str, quality: int = 92,
         }''')
 
         scroll_height = container_info.get('scrollHeight', 10000)
-        step = 500
-        total_steps = max(int(scroll_height / step) + 6, 30)
+        step = 400
+        total_steps = max(int(scroll_height / step) + 8, 30)
 
         log_cb(f"  [PDF Scan] Chiều cao tài liệu: {scroll_height}px (~{total_steps} bước quét)...")
 
@@ -258,9 +410,12 @@ async def download_drive_pdf(file_url: str, output_path: str, quality: int = 92,
         if total_pages == 0:
             raise Exception("Không trích xuất được trang PDF nào từ Google Drive.")
 
+        log_cb(f"  [PDF Compiler] Đang tối ưu hình ảnh và tích hợp Lớp Text Layer cho {total_pages} trang...")
         pdf_doc = pymupdf.open()
+        font_path = get_system_ttf_font()
         sorted_indices = sorted(pages_captured.keys())
 
+        text_layer_count = 0
         for idx in sorted_indices:
             img_bytes = pages_captured[idx]
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -269,19 +424,63 @@ async def download_drive_pdf(file_url: str, output_path: str, quality: int = 92,
             img.save(opt_buf, format="JPEG", quality=quality, optimize=True)
             opt_bytes = opt_buf.getvalue()
 
-            pt_w = img.width * 72 / 96
-            pt_h = img.height * 72 / 96
+            # Nhận diện chính xác hướng trang (Landscape vs Portrait)
+            is_landscape = img.width > img.height
+
+            if idx in page_dimensions:
+                dpi, d1, d2 = page_dimensions[idx]
+                if is_landscape:
+                    pt_w = max(float(d1), float(d2))
+                    pt_h = min(float(d1), float(d2))
+                else:
+                    pt_w = min(float(d1), float(d2))
+                    pt_h = max(float(d1), float(d2))
+            else:
+                pt_w = img.width * 72 / 96
+                pt_h = img.height * 72 / 96
 
             rect = pymupdf.Rect(0, 0, pt_w, pt_h)
             pdf_page = pdf_doc.new_page(width=pt_w, height=pt_h)
+            # 1. Gắn ảnh trang siêu nét
             pdf_page.insert_image(rect, stream=opt_bytes)
+
+            # 2. Gắn lớp văn bản vô hình (Invisible Text Layer) chuẩn xác từng cụm cột
+            if idx in text_layers and text_layers[idx]:
+                text_layer_count += 1
+                font_id = 'f0'
+                if font_path:
+                    try:
+                        pdf_page.insert_font(fontname=font_id, fontfile=font_path)
+                    except Exception:
+                        font_id = 'helv'
+                else:
+                    font_id = 'helv'
+
+                for seg in text_layers[idx]:
+                    y, x, h, w = seg['box']
+                    pt = pymupdf.Point(float(x), float(y) + float(h) * 0.82)
+                    try:
+                        pdf_page.insert_text(
+                            pt,
+                            seg['text'],
+                            fontname=font_id,
+                            fontsize=max(float(h) * 0.78, 6.0),
+                            render_mode=3 # Lớp text ẩn hỗ trợ bôi đen & tìm kiếm
+                        )
+                    except Exception:
+                        pass
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         pdf_doc.save(output_path, deflate=True)
         pdf_doc.close()
 
-        log_cb(f"  ✓ Đã xuất tệp PDF hoàn chỉnh: {os.path.basename(output_path)} ({total_pages} trang)")
+        if text_layer_count > 0:
+            log_cb(f"  ✓ Đã xuất PDF hoàn tất: {os.path.basename(output_path)} ({total_pages} trang, kèm Lớp Text Layer bôi đen/tìm kiếm)")
+        else:
+            log_cb(f"  ✓ Đã xuất tệp PDF hoàn chỉnh: {os.path.basename(output_path)} ({total_pages} trang)")
         return output_path
+
+
 
 
 # --- DOCX CONVERSION UTILS ---
@@ -557,13 +756,48 @@ def download_single_docx(url: str, output_path: str, log_cb=print) -> str:
 
 
 async def download_single_pdf(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
-    """Tải PDF từ Google Docs Canvas Engine hoặc Google Drive PDF Viewer"""
+    """Tải PDF từ Google Docs Native Vector Engine hoặc Google Drive PDF Viewer với Text Layer"""
     if "drive.google.com/file" in url:
         return await download_drive_pdf(url, output_path, quality=quality, log_cb=log_cb)
 
     doc_id, _ = extract_id_and_type(url)
+
+    # 1. Thử xuất Native Vector PDF từ Semantic HTML của Google Docs (Chuẩn 100% Text, Font, Layout)
+    mobile_url = f"https://docs.google.com/document/d/{doc_id}/mobilebasic"
+    try:
+        log_cb(f"  [PDF Vector] Đang trích xuất cấu trúc văn bản: {doc_id}")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        r = requests.get(mobile_url, headers=headers, timeout=20)
+        if r.status_code == 200 and len(r.text) > 500:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.set_content(r.text, wait_until="load")
+                await page.add_style_tag(content="""
+                    @page { size: A4; margin: 20mm 15mm 20mm 15mm; }
+                    body { font-family: 'Times New Roman', 'Arial', sans-serif !important; color: #000 !important; background: #fff !important; }
+                    #header, #footer, .mobile-header, .mobile-footer { display: none !important; }
+                    .doc-content { width: 100% !important; margin: 0 !important; padding: 0 !important; }
+                """)
+                pdf_bytes = await page.pdf(
+                    format="A4",
+                    print_background=True,
+                    margin={"top": "20mm", "bottom": "20mm", "left": "15mm", "right": "15mm"}
+                )
+                await browser.close()
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                with open(output_path, "wb") as f:
+                    f.write(pdf_bytes)
+                log_cb(f"  ✓ Đã xuất PDF Vector chuẩn 100% Text: {os.path.basename(output_path)}")
+                return output_path
+    except Exception as e:
+        log_cb(f"  ⚠️ Chuyển sang Canvas Engine: {e}")
+
+    # 2. Dự phòng: Canvas Engine
     doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
-    log_cb(f"  [PDF] Đang kết xuất Canvas tài liệu: {doc_id}")
+    log_cb(f"  [PDF Canvas] Đang kết xuất Canvas tài liệu: {doc_id}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -579,6 +813,7 @@ async def download_single_pdf(url: str, output_path: str, scale: int = 2, qualit
         except Exception:
             pass
         await page.wait_for_timeout(2000)
+
 
         result = await page.evaluate('''async () => {
             const editor = document.querySelector('.kix-appview-editor');
@@ -649,3 +884,338 @@ async def download_single_pdf(url: str, output_path: str, scale: int = 2, qualit
         
         log_cb(f"  ✓ Đã xuất tệp PDF: {os.path.basename(output_path)} ({result['totalPages']} trang)")
         return output_path
+
+
+# --- GOOGLE SLIDES / PPTX DOWNLOADER (VECTOR & RETINA SLIDE CAPTURE) ---
+async def extract_slides_from_google_presentation(url: str, scale: int = 2, log_cb=print) -> list:
+    """Trích xuất hình ảnh toàn bộ các slide chất lượng cao (Retina 4K) từ Google Slides / Presentation (không dính menu/toolbar)"""
+    doc_id, _ = extract_id_and_type(url)
+    log_cb(f"  [Google Slides] Đang kết nối tới bài thuyết trình: {doc_id}")
+
+    captured_slides = {} # pos (int) -> image bytes
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            device_scale_factor=scale
+        )
+        page = await context.new_page()
+
+        embed_url = f"https://docs.google.com/presentation/d/{doc_id}/embed"
+        await page.goto(embed_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3500)
+
+        # Ẩn hoàn toàn thanh công cụ điều khiển phía dưới để đảm bảo 100% hình ảnh slide sạch và nét
+        await page.add_style_tag(content="""
+            .punch-viewer-navbar, .punch-viewer-navbar-container {
+                display: none !important;
+            }
+            .punch-viewer-content {
+                bottom: 0 !important;
+            }
+        """)
+        await page.wait_for_timeout(400)
+
+        # Lấy tổng số lượng slide trong tài liệu
+        total_slides = await page.evaluate('''() => {
+            const opt = document.querySelector('.punch-viewer-navbar-page [role="option"]');
+            return opt ? parseInt(opt.getAttribute('aria-setsize') || '0') : 0;
+        }''')
+
+        if total_slides > 0:
+            log_cb(f"  [Google Slides] Phát hiện tổng cộng {total_slides} slide. Bắt đầu trích xuất...")
+        else:
+            log_cb(f"  [Google Slides] Bắt đầu quét và trích xuất slide...")
+
+        last_logged_pos = 0
+        step_count = 0
+        max_steps = max(total_slides * 4 + 20, 250) if total_slides > 0 else 250
+
+        while step_count < max_steps:
+            step_count += 1
+
+            status = await page.evaluate('''() => {
+                const opt = document.querySelector('.punch-viewer-navbar-page [role="option"]');
+                const nextBtn = document.querySelector('.punch-viewer-navbar-next');
+                const isDisabled = nextBtn ? (nextBtn.getAttribute('aria-disabled') === 'true' || nextBtn.classList.contains('goog-flat-button-disabled')) : false;
+                return {
+                    pos: opt ? parseInt(opt.getAttribute('aria-posinset') || '1') : 1,
+                    total: opt ? parseInt(opt.getAttribute('aria-setsize') || '1') : 1,
+                    nextDisabled: isDisabled
+                };
+            }''')
+
+            pos = status['pos']
+            total = status['total'] or total_slides or 1
+
+            if pos != last_logged_pos:
+                log_cb(f"    ✓ Đã nạp Slide {pos}/{total}")
+                last_logged_pos = pos
+
+            # Chụp vùng hiển thị slide chính
+            container = page.locator('.punch-viewer-content, .punch-viewer-svgpage, svg').first
+            if await container.count() > 0:
+                img_bytes = await container.screenshot(type="png")
+            else:
+                img_bytes = await page.screenshot(type="png")
+
+            # Ghi đè trạng thái cuối cùng của từng slide (đảm bảo hiển thị đầy đủ mọi hiệu ứng/nội dung hoàn chỉnh)
+            captured_slides[pos] = img_bytes
+
+            if status['nextDisabled']:
+                log_cb(f"  [Google Slides] Đã duyệt đến slide cuối cùng ({pos}/{total}). Hoàn tất trích xuất!")
+                break
+
+            if pos >= total and status['nextDisabled']:
+                break
+
+            # Bấm sang bước tiếp theo
+            await page.keyboard.press("ArrowRight")
+            await page.wait_for_timeout(250)
+
+        await browser.close()
+
+    sorted_indices = sorted(captured_slides.keys())
+    if not sorted_indices:
+        raise Exception("Không thể trích xuất slide nào từ bài thuyết trình Google Slides.")
+
+    # Trả về danh sách hình ảnh theo thứ tự từ slide 1 đến slide cuối cùng
+    return [captured_slides[idx] for idx in sorted_indices]
+
+
+def extract_slide_texts_from_presentation(url: str, log_cb=print) -> list:
+    """Trích xuất text từng slide từ Google Slides qua endpoint htmlpresent (không cần login)"""
+    doc_id, _ = extract_id_and_type(url)
+    html_url = f"https://docs.google.com/presentation/d/{doc_id}/htmlpresent"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        r = requests.get(html_url, headers=headers, timeout=20)
+        if r.status_code != 200:
+            log_cb(f"  [Text Extract] Không thể lấy text htmlpresent (HTTP {r.status_code})")
+            return []
+    except Exception as e:
+        log_cb(f"  [Text Extract] Lỗi kết nối: {e}")
+        return []
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    full_text = soup.get_text(separator='\n')
+    lines = [l.strip() for l in full_text.split('\n') if l.strip()]
+
+    slides = []
+    current_slide = []
+    total = None
+    slide_pattern = re.compile(r'^(\d+)/(\d+)$')
+    num_only = re.compile(r'^\d+$')
+
+    for line in lines:
+        m = slide_pattern.match(line)
+        if m:
+            total = int(m.group(2))
+            if current_slide:
+                slides.append(current_slide)
+            current_slide = []
+        elif total is not None:
+            # Lọc bỏ các dòng chỉ là số (số thứ tự mục)
+            if not num_only.match(line) and len(line) > 1:
+                current_slide.append(line)
+
+    if current_slide:
+        slides.append(current_slide)
+
+    log_cb(f"  [Text Extract] Trích xuất text xong: {len(slides)}/{total or '?'} slide")
+    return slides
+
+
+def _pptx_set_transparent_fill(shape):
+    """Xóa fill của shape (trong suốt hoàn toàn) và bỏ border"""
+    sp = shape._element
+    spPr = sp.find('.//' + pptx_qn('p:spPr'))
+    if spPr is None:
+        return
+    # Xóa fill cũ
+    for tag in [pptx_qn('a:noFill'), pptx_qn('a:solidFill'), pptx_qn('a:gradFill'), pptx_qn('a:pattFill'), pptx_qn('a:blipFill')]:
+        for el in spPr.findall('.//' + tag):
+            el.getparent().remove(el)
+    # Thêm noFill
+    etree.SubElement(spPr, pptx_qn('a:noFill'))
+    # Thêm/cập nhật border: noFill
+    ln = spPr.find(pptx_qn('a:ln'))
+    if ln is None:
+        ln = etree.SubElement(spPr, pptx_qn('a:ln'))
+    for child in list(ln):
+        ln.remove(child)
+    etree.SubElement(ln, pptx_qn('a:noFill'))
+
+
+def download_single_presentation_pptx(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
+    """Tải và đóng gói toàn bộ bài thuyết trình Google Slides / PPTX sang định dạng PowerPoint (.pptx) chuẩn 100%"""
+    doc_id, _ = extract_id_and_type(url)
+    log_cb(f"  [PPTX Compiler] Đang khởi tạo tệp PowerPoint cho: {doc_id}")
+
+    slide_images = asyncio.run(extract_slides_from_google_presentation(url, scale=scale, log_cb=log_cb))
+    total_slides = len(slide_images)
+
+    log_cb(f"  [PPTX Compiler] Đang đóng gói {total_slides} slide sang tệp .pptx...")
+    prs = Presentation()
+
+    # Kiểm tra kích thước hình ảnh đầu tiên để nhận diện tỷ lệ (16:9 Widescreen vs 4:3 Standard)
+    first_img = Image.open(io.BytesIO(slide_images[0]))
+    aspect = first_img.width / first_img.height if first_img.height > 0 else 1.777
+
+    if aspect > 1.5:
+        # Tỷ lệ 16:9 Widescreen (13.333 x 7.5 inches)
+        prs.slide_width = PptxInches(13.333)
+        prs.slide_height = PptxInches(7.5)
+    else:
+        # Tỷ lệ 4:3 Standard (10.0 x 7.5 inches)
+        prs.slide_width = PptxInches(10.0)
+        prs.slide_height = PptxInches(7.5)
+
+    blank_layout = prs.slide_layouts[6] # Layout hoàn toàn trống
+
+    for idx, img_b in enumerate(slide_images):
+        slide = prs.slides.add_slide(blank_layout)
+        slide.shapes.add_picture(
+            io.BytesIO(img_b),
+            0,
+            0,
+            width=prs.slide_width,
+            height=prs.slide_height
+        )
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    prs.save(output_path)
+    log_cb(f"  ✓ Đã xuất tệp PowerPoint: {os.path.basename(output_path)} ({total_slides} slide, {os.path.getsize(output_path)/1024:.1f} KB)")
+    return output_path
+
+
+def download_single_presentation_pptx_editable(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
+    """Tạo PPTX lai: hình ảnh nền chất lượng cao + text layer trong suốt chỉnh sửa được + Speaker Notes đầy đủ"""
+    doc_id, _ = extract_id_and_type(url)
+    log_cb(f"  [PPTX Editable] Đang khởi tạo PowerPoint chỉnh sửa được cho: {doc_id}")
+
+    # Bước 1: Lấy hình ảnh slide
+    slide_images = asyncio.run(extract_slides_from_google_presentation(url, scale=scale, log_cb=log_cb))
+    total_slides = len(slide_images)
+
+    # Bước 2: Lấy text từng slide
+    log_cb(f"  [PPTX Editable] Đang trích xuất text từng slide...")
+    slide_texts = extract_slide_texts_from_presentation(url, log_cb=log_cb)
+
+    log_cb(f"  [PPTX Editable] Đang đóng gói {total_slides} slide với text layer...")
+    prs = Presentation()
+
+    # Nhận diện tỷ lệ khung hình
+    first_img = Image.open(io.BytesIO(slide_images[0]))
+    aspect = first_img.width / first_img.height if first_img.height > 0 else 1.777
+    if aspect > 1.5:
+        prs.slide_width = PptxInches(13.333)
+        prs.slide_height = PptxInches(7.5)
+    else:
+        prs.slide_width = PptxInches(10.0)
+        prs.slide_height = PptxInches(7.5)
+
+    blank_layout = prs.slide_layouts[6]
+
+    for idx, img_b in enumerate(slide_images):
+        slide = prs.slides.add_slide(blank_layout)
+
+        # --- Lớp 1: Hình ảnh nền toàn trang ---
+        slide.shapes.add_picture(
+            io.BytesIO(img_b),
+            0, 0,
+            width=prs.slide_width,
+            height=prs.slide_height
+        )
+
+        # --- Lớp 2: Text box trong suốt, phủ toàn slide ---
+        texts = slide_texts[idx] if idx < len(slide_texts) else []
+        if texts:
+            text_content = '\n'.join(texts)
+
+            # Text box phủ phần lớn slide (để dành 5% margin)
+            margin = PptxInches(0.3)
+            txBox = slide.shapes.add_textbox(
+                margin,
+                margin,
+                prs.slide_width - margin * 2,
+                prs.slide_height - margin * 2
+            )
+
+            # Làm cho text box trong suốt hoàn toàn (không có fill, không có border)
+            _pptx_set_transparent_fill(txBox)
+
+            tf = txBox.text_frame
+            tf.word_wrap = True
+            tf.auto_size = None
+
+            # Xóa paragraph mặc định và thêm từng dòng
+            tf.clear()
+            for i, line in enumerate(texts):
+                if i == 0:
+                    p = tf.paragraphs[0]
+                else:
+                    p = tf.add_paragraph()
+                run = p.add_run()
+                run.text = line
+                # Font: nhỏ (7pt), màu trắng -> vô hình trên nền sáng, nhưng text vẫn selecteable
+                run.font.size = PptxPt(7)
+                run.font.color.rgb = PptxRGB(0xFF, 0xFF, 0xFF)  # trắng
+                run.font.bold = False
+
+            # --- Lớp 3: Speaker Notes (text đầy đủ, dễ đọc) ---
+            try:
+                notes_slide = slide.notes_slide
+                notes_tf = notes_slide.notes_text_frame
+                notes_tf.clear()
+                notes_tf.text = f"[Slide {idx + 1}]\n" + text_content
+                for para in notes_tf.paragraphs:
+                    for run in para.runs:
+                        run.font.size = PptxPt(11)
+            except Exception:
+                pass
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    prs.save(output_path)
+    log_cb(f"  ✓ Đã xuất PPTX Editable: {os.path.basename(output_path)} ({total_slides} slide, {os.path.getsize(output_path)/1024:.1f} KB)")
+    log_cb(f"  💡 Mẹo: Mở file trong PowerPoint → Click vào slide → Ctrl+A để chọn/copy toàn bộ text. Xem thêm ở khung 'Ghi chú' (Notes) bên dưới.")
+    return output_path
+
+
+def download_single_presentation_pdf(url: str, output_path: str, scale: int = 2, quality: int = 92, log_cb=print) -> str:
+    """Tải và đóng gói bài thuyết trình Google Slides / PPTX sang tệp PDF (.pdf) siêu nét"""
+    doc_id, _ = extract_id_and_type(url)
+    log_cb(f"  [PDF Slides] Đang khởi tạo tệp PDF trình chiếu cho: {doc_id}")
+
+    slide_images = asyncio.run(extract_slides_from_google_presentation(url, scale=scale, log_cb=log_cb))
+    total_slides = len(slide_images)
+
+    log_cb(f"  [PDF Slides] Đang tối ưu hình ảnh cho {total_slides} slide...")
+    pdf_doc = pymupdf.open()
+
+    first_img = Image.open(io.BytesIO(slide_images[0]))
+    aspect = first_img.width / first_img.height if first_img.height > 0 else 1.777
+
+    if aspect > 1.5:
+        pt_w, pt_h = 960.0, 540.0  # 16:9
+    else:
+        pt_w, pt_h = 720.0, 540.0  # 4:3
+
+    rect = pymupdf.Rect(0, 0, pt_w, pt_h)
+
+    for idx, img_b in enumerate(slide_images):
+        img = Image.open(io.BytesIO(img_b)).convert("RGB")
+        opt_buf = io.BytesIO()
+        img.save(opt_buf, format="JPEG", quality=quality, optimize=True)
+        opt_bytes = opt_buf.getvalue()
+
+        pdf_page = pdf_doc.new_page(width=pt_w, height=pt_h)
+        pdf_page.insert_image(rect, stream=opt_bytes)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    pdf_doc.save(output_path, deflate=True)
+    pdf_doc.close()
+    log_cb(f"  ✓ Đã xuất tệp PDF bài thuyết trình: {os.path.basename(output_path)} ({total_slides} slide, {os.path.getsize(output_path)/1024:.1f} KB)")
+    return output_path
+

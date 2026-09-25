@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const urlInput = document.getElementById('urlInput');
     const btnClearUrl = document.getElementById('btnClearUrl');
     const btnScan = document.getElementById('btnScan');
+    const btnDemoSlides = document.getElementById('btnDemoSlides');
     const btnDemoFolder = document.getElementById('btnDemoFolder');
     const btnDemoPdf = document.getElementById('btnDemoPdf');
     const btnDemoFile = document.getElementById('btnDemoFile');
@@ -41,6 +42,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let selectedFormat = "docx";
 
     // 1. QUICK DEMO BUTTONS
+    if (btnDemoSlides) {
+        btnDemoSlides.addEventListener('click', () => {
+            urlInput.value = "https://docs.google.com/presentation/d/1rmO-DqqLrK86lyS4GZ37cLTb_gNlYqaf/edit";
+            urlInput.dispatchEvent(new Event('input'));
+            btnScan.click();
+        });
+    }
+
     btnDemoFolder.addEventListener('click', () => {
         urlInput.value = "https://drive.google.com/drive/folders/1UAVZMjk0v-f-LY00KzTzCfiLwxwB3fUA";
         urlInput.dispatchEvent(new Event('input'));
@@ -73,6 +82,20 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // 3. FORMAT SELECTION
+    function setFormat(fmt) {
+        formatRadios.forEach(radio => {
+            const val = radio.getAttribute('data-value');
+            if (val === fmt) {
+                radio.classList.add('active');
+                const inp = radio.querySelector('input');
+                if (inp) inp.checked = true;
+                selectedFormat = fmt;
+            } else {
+                radio.classList.remove('active');
+            }
+        });
+    }
+
     formatRadios.forEach(radio => {
         radio.addEventListener('click', () => {
             formatRadios.forEach(r => r.classList.remove('active'));
@@ -130,6 +153,10 @@ document.addEventListener('DOMContentLoaded', () => {
     btnOpenDir.addEventListener('click', async () => {
         const path = outputDirInput.value.trim();
         try {
+            btnOpenDir.disabled = true;
+            btnOpenDir.innerHTML = '<span>⏳ Đang mở...</span>';
+            appendLog(new Date().toLocaleTimeString(), `Đang mở thư mục lưu trữ: ${path}`, 'info');
+
             const resp = await fetch('/api/open-folder', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -137,20 +164,33 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await resp.json();
             if (data.success) {
-                appendLog(new Date().toLocaleTimeString(), `Đã mở thư mục trong File Explorer: ${path}`, 'info');
+                appendLog(new Date().toLocaleTimeString(), `✓ Đã mở thư mục trong File Explorer: ${data.path || path}`, 'success');
             } else {
+                appendLog(new Date().toLocaleTimeString(), `Không thể mở thư mục: ${data.error || 'Lỗi không xác định'}`, 'error');
                 alert('Không thể mở thư mục: ' + (data.error || 'Lỗi'));
             }
         } catch (err) {
-            alert('Không thể mở thư mục: ' + err);
+            appendLog(new Date().toLocaleTimeString(), `Lỗi khi yêu cầu mở thư mục: ${err.message}`, 'error');
+            alert('Không thể mở thư mục: ' + err.message);
+        } finally {
+            btnOpenDir.disabled = false;
+            btnOpenDir.innerHTML = '<span>📂 Mở thư mục</span>';
         }
     });
+
+    const btnOpenDoneDir = document.getElementById('btnOpenDoneDir');
+    const progressActions = document.getElementById('progressActions');
+    if (btnOpenDoneDir) {
+        btnOpenDoneDir.addEventListener('click', () => {
+            btnOpenDir.click();
+        });
+    }
 
     // 5. SCANNING LOGIC
     btnScan.addEventListener('click', async () => {
         const url = urlInput.value.trim();
         if (!url) {
-            alert('Vui lòng nhập liên kết Google Drive hoặc Docs!');
+            alert('Vui lòng nhập liên kết Google Drive, Google Docs hoặc Google Slides!');
             urlInput.focus();
             return;
         }
@@ -173,6 +213,26 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             scannedItems = data.items || [];
+            
+            // Auto-switch format radio based on scanned item type
+            if (data.type === 'presentation') {
+                setFormat('pptx_text'); // Mặc định: PPTX Editable cho Google Slides
+            } else if (data.type === 'doc') {
+                setFormat('docx');
+            } else if (data.type === 'pdf') {
+                setFormat('pdf');
+            } else if (data.type === 'folder' && scannedItems.length > 0) {
+                const hasPres = scannedItems.some(it => it.isPresentation || (it.name || '').toLowerCase().endsWith('.pptx'));
+                const hasDoc = scannedItems.some(it => !it.isPresentation && !it.isPdf && !it.isFolder && ((it.name || '').toLowerCase().endsWith('.docx') || (it.url || '').includes('document')));
+                if (hasPres && hasDoc) {
+                    setFormat('all');
+                } else if (hasPres) {
+                    setFormat('pptx_text'); // Folder toàn slides -> mặc định PPTX Editable
+                } else if (hasDoc) {
+                    setFormat('docx');
+                }
+            }
+
             renderItemsTable(scannedItems, data.title || 'Danh sách tệp');
             itemsSection.style.display = 'block';
             itemsSection.scrollIntoView({ behavior: 'smooth' });
@@ -193,15 +253,29 @@ document.addEventListener('DOMContentLoaded', () => {
         folderTitleText.textContent = title;
         itemsTableBody.innerHTML = '';
 
-        if (items.length === 0) {
+        if (!items || items.length === 0) {
             itemsTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">Không tìm thấy tệp nào trong liên kết.</td></tr>';
             updateSelectedCount();
             return;
         }
 
         items.forEach((it, idx) => {
-            const isPdf = it.isPdf || it.name.toLowerCase().endsWith('.pdf');
-            const icon = it.isFolder ? '📁' : (isPdf ? '📕' : '📄');
+            const name = (it.name || '').toLowerCase();
+            const url = it.url || '';
+            const isPres = Boolean(!it.isFolder && (it.isPresentation || name.endsWith('.pptx') || name.endsWith('.ppt') || url.includes('presentation')));
+            const isPdf = Boolean(!it.isFolder && (!isPres) && (it.isPdf || name.endsWith('.pdf') || url.includes('drive.google.com/file')));
+            const isImg = Boolean(!it.isFolder && (!isPres) && (!isPdf) && (name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.png') || name.endsWith('.webp') || name.endsWith('.gif')));
+            
+            let icon = '📄';
+            if (it.isFolder) {
+                icon = '📁';
+            } else if (isPres) {
+                icon = '📊';
+            } else if (isPdf) {
+                icon = '📕';
+            } else if (isImg) {
+                icon = '🖼️';
+            }
             
             const tr = document.createElement('tr');
             tr.setAttribute('data-id', it.id);
@@ -211,10 +285,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td>
                     <div class="file-name-cell">
                         <span style="font-size: 16px;">${icon}</span>
-                        <span>${escapeHtml(it.name)}</span>
+                        <span>${escapeHtml(it.name || 'Không có tiêu đề')}</span>
                     </div>
                 </td>
-                <td><span class="file-id-text">${it.id}</span></td>
+                <td><span class="file-id-text">${it.id || ''}</span></td>
                 <td><span class="status-pill status-pending" id="status-${it.id}">Chờ tải</span></td>
             `;
             itemsTableBody.appendChild(tr);
@@ -282,6 +356,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btnScan.disabled = true;
 
         progressSection.style.display = 'block';
+        if (progressActions) progressActions.style.display = 'none';
         progressBarFill.style.width = '0%';
         progressPercentText.textContent = '0%';
         progressStatusTitle.textContent = `Đang bắt đầu tải ${selectedItems.length} tệp...`;
@@ -361,6 +436,10 @@ document.addEventListener('DOMContentLoaded', () => {
         progressStatusTitle.textContent = `🎉 Hoàn tất toàn bộ ${data.total} tệp!`;
         currentFileName.textContent = `Thành công: ${data.successCount}, Thất bại: ${data.failCount}`;
         
+        if (progressActions) {
+            progressActions.style.display = 'block';
+        }
+
         btnStartDownload.disabled = false;
         btnScan.disabled = false;
         systemStatusText.textContent = 'Hoàn thành tất cả tệp';

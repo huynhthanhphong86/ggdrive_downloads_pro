@@ -467,23 +467,39 @@ async def download_google_doc_to_pdf(url: str, output_path: str = None, scale: i
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tải tài liệu Google Docs & Drive PDF View-Only sang PDF hoặc DOCX")
-    parser.add_argument("url", nargs="?", default="https://docs.google.com/document/d/1KN5IuYT_D3wzsx1tJ0rdOQxrmpSs3uCX/edit", help="Đường link Google Docs hoặc Drive PDF cần tải")
-    parser.add_argument("-f", "--format", choices=["pdf", "docx", "all"], default="all", help="Định dạng xuất ra: pdf, docx hoặc all (mặc định: all)")
+    parser = argparse.ArgumentParser(description="Tải tài liệu Google Docs, Google Slides & Drive PDF View-Only sang PDF, DOCX hoặc PPTX")
+    parser.add_argument("url", nargs="?", default="https://docs.google.com/document/d/1KN5IuYT_D3wzsx1tJ0rdOQxrmpSs3uCX/edit", help="Đường link Google Docs, Google Slides hoặc Drive PDF cần tải")
+    parser.add_argument("-f", "--format", choices=["pdf", "docx", "pptx", "all"], default="all", help="Định dạng xuất ra: pdf, docx, pptx hoặc all (mặc định: all)")
     parser.add_argument("-o", "--output", help="Tên file xuất ra", default=None)
-    parser.add_argument("-s", "--scale", type=int, default=2, help="Độ phân giải DPI cho PDF (2 = 2x Retina)")
-    parser.add_argument("-q", "--quality", type=int, default=92, help="Chất lượng nén ảnh PDF (1-100, mặc định 92)")
+    parser.add_argument("-s", "--scale", type=int, default=2, help="Độ phân giải DPI cho PDF/PPTX (2 = 2x Retina)")
+    parser.add_argument("-q", "--quality", type=int, default=92, help="Chất lượng nén ảnh (1-100, mặc định 92)")
     parser.add_argument("--no-images", action="store_true", help="Không lưu ảnh PNG riêng lẻ")
 
     args = parser.parse_args()
 
-    # Check if URL is Google Drive PDF
+    # 1. Google Slides / Presentation
+    if "docs.google.com/presentation" in args.url:
+        from downloader_core import download_single_presentation_pptx, download_single_presentation_pdf
+        out_base = args.output or "GoogleSlides_Export"
+        if out_base.lower().endswith(".pptx") or out_base.lower().endswith(".pdf"):
+            out_base = os.path.splitext(out_base)[0]
+
+        if args.format in ["pptx", "all"]:
+            pptx_file = f"{out_base}.pptx"
+            download_single_presentation_pptx(args.url, pptx_file, scale=args.scale, quality=args.quality, log_cb=print)
+        if args.format in ["pdf", "all"]:
+            pdf_file = f"{out_base}.pdf"
+            download_single_presentation_pdf(args.url, pdf_file, scale=args.scale, quality=args.quality, log_cb=print)
+        return
+
+    # 2. Check if URL is Google Drive PDF
     if "drive.google.com/file" in args.url:
         from downloader_core import download_drive_pdf
         out = args.output or "Drive_Export.pdf"
         asyncio.run(download_drive_pdf(args.url, out, quality=args.quality, log_cb=print))
         return
 
+    # 3. Google Docs
     if args.format in ["docx", "all"]:
         download_google_doc_to_docx(args.url, args.output)
 
@@ -499,3 +515,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

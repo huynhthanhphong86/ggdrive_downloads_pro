@@ -28,7 +28,7 @@
                 </div>
                 <div>
                     <h1 class="logo-title">Google Drive <span>Downloads Pro</span></h1>
-                    <p class="logo-subtitle">Trình tải tài liệu Word, PDF & Thư mục Google Drive View-Only</p>
+                    <p class="logo-subtitle">Trình tải tài liệu Word (.docx), PowerPoint (.pptx), PDF (.pdf) & Thư mục Google Drive View-Only</p>
                 </div>
             </div>
             <div class="header-badges">
@@ -44,9 +44,12 @@
             <div class="card-header">
                 <div class="card-title">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
-                    <span>Nhập liên kết Google Drive (Folder / PDF) hoặc Google Docs</span>
+                    <span>Nhập liên kết Google Drive, Google Docs hoặc Google Slides (.pptx)</span>
                 </div>
                 <div class="quick-links">
+                    <button class="btn-chip" id="btnDemoSlides">
+                        <span>📊 Demo Google Slides (27 Slide)</span>
+                    </button>
                     <button class="btn-chip" id="btnDemoFolder">
                         <span>📁 Demo Thư mục (28 Bài)</span>
                     </button>
@@ -61,7 +64,7 @@
 
             <div class="input-form">
                 <div class="input-wrapper">
-                    <input type="text" id="urlInput" placeholder="Dán link thư mục, tệp PDF Drive hoặc tài liệu Docs (View-Only)..." spellcheck="false" autocomplete="off">
+                    <input type="text" id="urlInput" placeholder="Dán link Google Slides (.pptx), thư mục, PDF Drive hoặc Google Docs (View-Only)..." spellcheck="false" autocomplete="off">
                     <button class="btn-icon" id="btnClearUrl" title="Xóa">✕</button>
                 </div>
                 <button class="btn btn-primary" id="btnScan">
@@ -87,11 +90,11 @@
                     </div>
                     <div class="path-picker">
                         <input type="text" id="outputDirInput" value="{{ default_dir }}" spellcheck="false">
-                        <button class="btn btn-secondary" id="btnBrowseDir" title="Mở hộp thoại chọn thư mục">
+                        <button class="btn btn-secondary" id="btnBrowseDir" title="Mở hộp thoại chọn thư mục Windows">
                             <span>📁 Duyệt...</span>
                         </button>
-                        <button class="btn btn-icon-only" id="btnOpenDir" title="Mở thư mục trong File Explorer">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+                        <button class="btn btn-secondary" id="btnOpenDir" title="Mở thư mục trong File Explorer">
+                            <span>📂 Mở thư mục</span>
                         </button>
                     </div>
                     <!-- Quick location presets -->
@@ -110,7 +113,23 @@
                         Định dạng tải về
                     </label>
                     <div class="format-options">
-                        <label class="format-radio active" data-value="docx">
+                        <label class="format-radio" data-value="pptx" id="radioPptx">
+                            <input type="radio" name="format" value="pptx">
+                            <span class="radio-icon">📊</span>
+                            <div class="radio-info">
+                                <span class="radio-title">PowerPoint (.pptx)</span>
+                                <span class="radio-sub">Chuẩn slide 100%</span>
+                            </div>
+                        </label>
+                        <label class="format-radio" data-value="pptx_text" id="radioPptxText">
+                            <input type="radio" name="format" value="pptx_text">
+                            <span class="radio-icon">✏️</span>
+                            <div class="radio-info">
+                                <span class="radio-title">PPTX + Text (Editable)</span>
+                                <span class="radio-sub">Nền ảnh + text chỉnh sửa</span>
+                            </div>
+                        </label>
+                        <label class="format-radio active" data-value="docx" id="radioDocx">
                             <input type="radio" name="format" value="docx" checked>
                             <span class="radio-icon">📝</span>
                             <div class="radio-info">
@@ -118,20 +137,20 @@
                                 <span class="radio-sub">Chuẩn bản gốc 100%</span>
                             </div>
                         </label>
-                        <label class="format-radio" data-value="pdf">
+                        <label class="format-radio" data-value="pdf" id="radioPdf">
                             <input type="radio" name="format" value="pdf">
                             <span class="radio-icon">📄</span>
                             <div class="radio-info">
                                 <span class="radio-title">PDF (.pdf)</span>
-                                <span class="radio-sub">Gốc / Canvas Retina</span>
+                                <span class="radio-sub">Gốc / Retina 4K</span>
                             </div>
                         </label>
-                        <label class="format-radio" data-value="all">
+                        <label class="format-radio" data-value="all" id="radioAll">
                             <input type="radio" name="format" value="all">
                             <span class="radio-icon">📦</span>
                             <div class="radio-info">
-                                <span class="radio-title">Cả hai (.docx + .pdf)</span>
-                                <span class="radio-sub">Đầy đủ 2 định dạng</span>
+                                <span class="radio-title">Tất cả định dạng</span>
+                                <span class="radio-sub">Tải trọn bộ tệp</span>
                             </div>
                         </label>
                     </div>
@@ -189,6 +208,11 @@
             </div>
             <div class="progress-bar-bg">
                 <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+            </div>
+            <div class="progress-actions" id="progressActions" style="display: none; margin-top: 14px; text-align: right;">
+                <button class="btn btn-primary btn-sm" id="btnOpenDoneDir" title="Mở thư mục chứa các tệp đã tải xong">
+                    <span>📂 Mở thư mục tải về</span>
+                </button>
             </div>
         </section>
 
